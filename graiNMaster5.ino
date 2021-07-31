@@ -5,7 +5,7 @@
   Testé et compilé sur Arduino IDE v1.6.8
 *******************************************************/
 
-#define version  " --V1.004-- "
+#define version  " --V1.005-- "
 
 /*
   v1.000 le 14/05/2016
@@ -39,8 +39,9 @@
 
 
 #define DEBUG           // Décommenter pour afficher les informations de deboguage (PID sur le LCD)
-//#define DEUXSONDES      // Décommenter pour l'utilisation de deux sondes de température (DS18B202) - il est possible de n'utiliser qu'un seul canal OneWire pour toutes les sondes, ce n'est pas l'option d'ici, ce sont bien deux canaux distincts !
-//#define DAC             // Décommenter pour utilisation du DAC (Version Originale)
+//#define ADS1015             // Décommenter pour utilisation du DAC (Version Originale)
+//#define DS18B20         // DS18B20
+#define MAX31865
 //#define BIPPEUR         // Commenter pour ne pas utiliser de buzzer
 //#define EEPROMRW        // Décommenter pour enregistrement sur l'EEPROM si pas de carte SD
 #define DEFIL           // Commenter pour ne pas faire alterner le texte sur la deuxième ligne pour afficher le temps restant total avant la fin de l'ébullition
@@ -58,12 +59,6 @@
   #define DEBUGPRINTLN(x)
 #endif
 
-#ifdef DEUXSONDES
-  #define DIF_DEUXSONDES(x) + String(x)
-#else
-  #define DIF_DEUXSONDES(x)
-#endif
-
 #ifdef EEPROMRW
   #include <EEPROMex.h>
   #include <EEPROMVar.h>  // gestion des enregistrements en EEPROM
@@ -79,22 +74,29 @@ byte DETECT = 2 , GATE = 3; //Broches utilisées pour le pilotage du triac -> de
 byte PULSE = 4  ; //triac gate pulse : largeur de l'impulsion pour activer le triac, en nombre de cycles d'horloge
 int HALF_WAVE = 560;// //nombre de "tics" d'horloge à chaque demi onde 50Hz . 625 théoriques, mais 560 réels .
 
-#if !(defined(DAC)) // Déclaration de la sonde de température DS18B20 si l'on n'utilise pas de DAC
+#if defined(DS18B20) // Déclaration de la sonde de température DS18B20 si l'on n'utilise pas de DAC
   #include <Wire.h>
   #include <OneWire.h>
   #include <DallasTemperature.h>
 
   byte ONE_WIRE_BUS = 30;  // DS18B20 pin
   OneWire oneWire(ONE_WIRE_BUS);
-  DallasTemperature DS18B20(&oneWire);
+  DallasTemperature DS18(&oneWire);
 #endif
 
-// Déclaration de la deuxième sonde DS18B20 si jamais elle doit être définie (DEUXSONDES doit exister et ne pas être commenté)
-#if defined(DEUXSONDES)
-  byte ONE_WIRE_BUS2 = 31; // DS18B20 pin (2ème sonde)
-  OneWire oneWire2(ONE_WIRE_BUS2);
-  DallasTemperature DS18B202(&oneWire2);
-  float diff_deuxsondes; // Différence entre les deux sondes, si deux sont utilisées
+#if defined(MAX31865)
+  #include <Adafruit_MAX31865.h>
+  
+  // Use software SPI: CS, DI, DO, CLK
+  Adafruit_MAX31865 thermo = Adafruit_MAX31865(42, 40, 38, 36);
+  // use hardware SPI, just pass in the CS pin
+  //Adafruit_MAX31865 thermo = Adafruit_MAX31865(10);
+  
+  // The value of the Rref resistor. Use 430.0 for PT100 and 4300.0 for PT1000
+  #define RREF      430.0
+  // The 'nominal' 0-degrees-C resistance of the sensor
+  // 100.0 for PT100, 1000.0 for PT1000
+  #define RNOMINAL  100.0
 #endif
 
 // constantes pour les touches reliées au module LCD
@@ -105,7 +107,7 @@ int HALF_WAVE = 560;// //nombre de "tics" d'horloge à chaque demi onde 50Hz . 6
 #define btnSELECT 4
 #define btnNONE   5
 
-#if defined(DAC)
+#if defined(ADS1015)
   #include <Adafruit_ADS1015.h> // gestion du CAN 16 bits
   // pour la lecture de la sonde via le DAC (Version Originale)
   byte THERM_PIN2  = 1 ;// entrée n°1 du dac 16bits
@@ -249,18 +251,25 @@ void setup()
 
   #if defined(DEBUG)
       Serial.begin(9600);
-      Serial.print("Startup ok\n");
+      DEBUGPRINTLN  ("Startup ok\n");
   #endif
   
-  #if defined(DAC)
+  #if defined(ADS1015)
       // démarrage du DAC 16 bits
       ads1115.begin(); // (Version Originale)
   #endif
-     
+
+
+  #if defined(MAX31865)
+    DEBUGPRINTLN("Adafruit MAX31865 PT100 Sensor Test!");
+    thermo.begin(MAX31865_2WIRE);  // set to 3WIRE or 4WIRE as necessary
+  #endif
+
+  
   //config pour SD
   String inString = "";
   
-  //pinMode(53, OUTPUT); //la pin 53 est normalement attribuée à la fonction SPI Slave Select (SS)Permet d'activer ou désactiver le périphérique
+  pinMode(53, OUTPUT); //la pin 53 est normalement attribuée à la fonction SPI Slave Select (SS)Permet d'activer ou désactiver le périphérique
   // Suivant les modules SD, il peut être nécessaire de commenter cette ligne (c'est le cas de mon module même si c'est pas logique)
 
 
@@ -361,7 +370,7 @@ void setup()
         {
           inString.remove(0, 10); // Remove 10 characters starting at index=0
 
-          #if defined(DAC)
+          #if defined(ADS1015)
               THERM_PIN2 = inString.toInt();
           #endif
           check_data++;
@@ -371,7 +380,7 @@ void setup()
         if (inString.startsWith("THERMPIN1"))
         {
           inString.remove(0, 10); // Remove 10 characters starting at index=0
-          #if defined(DAC)
+          #if defined(ADS1015)
               THERM_PIN = inString.toInt();
           #endif
           check_data++;
@@ -380,7 +389,7 @@ void setup()
         if (inString.startsWith("OFSETPRBE"))
         {
           inString.remove(0, 10); // Remove 10 characters starting at index=0
-          #if defined(DAC)
+          #if defined(ADS1015)
               OFFSET_PROBE = inString.toInt();
           #endif
           check_data++;
@@ -389,7 +398,7 @@ void setup()
         if (inString.startsWith("COEFPROBE"))
         {
           inString.remove(0, 10); // Remove 10 characters starting at index=0
-          #if defined(DAC)
+          #if defined(ADS1015)
               COEF_PROBE = inString.toInt();
           #endif
           check_data++;
@@ -524,17 +533,8 @@ void setup()
         if (inString.startsWith("ONEWIRE00"))
         {
           inString.remove(0, 10); // Remove 10 characters starting at index=0
-          #if !(defined(DAC))
+          #if defined(DS18B20)
               ONE_WIRE_BUS = inString.toInt();
-          #endif
-          check_data++;
-        }
-
-        if (inString.startsWith("ONEWIRE02"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          #if (defined(DEUXSONDES))
-              ONE_WIRE_BUS2 = inString.toInt();
           #endif
           check_data++;
         }
@@ -579,14 +579,6 @@ void setup()
     #endif
   }
 
-//////// Pour créer un nom de fichier différent à chaque brassage (ou presque), on prend la durée que l'utilisateur a pris pour appuyer sur le bouton comme variable de seed pour la fonction random (aléatoire)
-  unsigned long millisec = millis();
-  CLS();
-  lcd.print(" APPUYEZ SUR UN ");
-  lcd.setCursor(0, 1);
-  lcd.print("     BOUTON     ");
-  while(read_LCD_buttons() == btnNONE); // On attend que l'utilisateur appuie sur un bouton
-  randomSeed(millisec - millis());     // On initialise de manière pseudo-aléatoire le générateur de nombres pseudo-aléatoires, avec la durée de pression sur un bouton en millisecondes
   datalogFile = "log" + String(random(0, 99999)) + ".txt"; // Le nom du fichier, avec un numéro pseudo-aléatoire pour éviter de réécrire sur le même à chaque brassin
   DEBUGPRINTLN("Datalogfile = " + datalogFile);
 
@@ -719,7 +711,6 @@ void display_palier(int numpalier, String *line1, String *line2) {
   if (defilement) { // on affiche alternativement la température en cours et la température à atteindre, ou...
 #endif
     *line2 = *line2 + degre + "C ";
-    *line2 = *line2 DIF_DEUXSONDES("DIF:" + String((int)((abs(diff_deuxsondes))))); // Ne va s'ajouter que si on active les deux sondes (désactivation : enlever #define DEUXSONDES)
     *line2 = *line2 PID_DEBUG("PID:" + String((int)ceil(tx_chauffe)) + "  "); // Ne va s'ajouter que si on active la fonction de debug (désactivation : enlever #define PIDDEBUG)
 #ifdef DEFIL
   }
@@ -776,7 +767,6 @@ void LCD_upd() // affiche les infos à l'écran ********************************
       Ligne1 = myPaliers[1][0];
       Ligne2 = String((int)theta_mesure) + "/" + String((int)myTemperatures[0]) + degre + "C ";
       Ligne2 = Ligne2 PID_DEBUG("PID:" + String(tx_chauffe)); // Ne va s'ajouter que si on active la fonction de debug (désactivation : commenter #define DEBUG)
-      Ligne2 = Ligne2 DIF_DEUXSONDES("DIF:" + String(diff_deuxsondes)); // Ne va s'ajouter que si on active les deux sondes (désactivation : commenter #define DEUXSONDES)
       break;
     }
     case 9:   // palier 1
@@ -872,7 +862,7 @@ float gettemp()
   float ttt;
 
 // Version Originale avec DAC
-  #if defined(DAC)
+  #if defined(ADS1015)
         int16_t therm, therm2;
         float ttt2;       // Le DAC à 2 entrées reliées à la même sonde. Pour déparasiter, on fait une moyenne des deux lectures
         therm = ads1115.readADC_SingleEnded(THERM_PIN);
@@ -884,47 +874,51 @@ float gettemp()
         ttt = ttt / COEF_PROBE;
         ttt2 = ttt2 / COEF_PROBE;
         ttt = (ttt + ttt2) / 2;
-
-// Version avec deux sondes
-  #elif defined(DEUXSONDES)
-        float ttt2; 
-        DS18B20.requestTemperatures();
-        ttt = DS18B20.getTempCByIndex(0);
-        DS18B202.requestTemperatures(); // récupérer la température de la deuxième sonde
-        ttt2 = DS18B202.getTempCByIndex(0);
-
-        if (ttt < 1) {
-          if (ttt2 < 1) {    // les 2 sondes de températures sont dans les choux (on lit 0° ou -127°)(sauf si vous vivez au Pôle Nord) => on prend la dernière valeur dispo
-            ttt = last_temp;
-          }
-          // sinon il n'y a que la première sonde qui est à l'ouest => on prend la valeur de la deuxième sonde uniquement
-          else {
-            ttt = ttt2;              
-          }
-        }
-/*        else if (ttt2 < 1) {
-          
-        }*/ // Pas besoin : ttt est déjà la valeur que l'on cherche
-        // enfin, si les deux sondes sont ok, on fait la moyenne des deux températures
-        else if (ttt2 > 0 ) {
-          diff_deuxsondes = ttt2 - ttt;
-          ttt = (ttt + ttt2) / 2;         // faire la moyenne des deux températures
-        }
-
-        // 1 BIP court si jamais la déviation de température est d'au moins 3°C entre les deux sondes
-        if ( abs(diff_deuxsondes) >= 3 ) {
-              BeepON(100);
-        }
-        
-// Version avec une sonde
-  #else
-        DS18B20.requestTemperatures(); 
-        ttt = DS18B20.getTempCByIndex(0);
+  #endif
+  
+  #if defined(DS18B20)
+        DS18.requestTemperatures(); 
+        ttt = DS18.getTempCByIndex(0);
         // La sonde est dans les choux (on lit 0° ou -127°) 
         if (ttt < 1) {
            ttt = last_temp;   // on prend la dernière valeur qui était cohérente
         }
   #endif
+
+#if defined(MAX31865)
+  uint16_t rtd = thermo.readRTD();
+
+  float ratio = rtd;
+  ratio /= 32768;
+
+  // Check and print any faults
+  uint8_t fault = thermo.readFault();
+  if (fault) {
+    Serial.print("Fault 0x"); Serial.println(fault, HEX);
+    if (fault & MAX31865_FAULT_HIGHTHRESH) {
+      DEBUGPRINTLN("RTD High Threshold"); 
+    }
+    if (fault & MAX31865_FAULT_LOWTHRESH) {
+      DEBUGPRINTLN("RTD Low Threshold"); 
+    }
+    if (fault & MAX31865_FAULT_REFINLOW) {
+      DEBUGPRINTLN("REFIN- > 0.85 x Bias"); 
+    }
+    if (fault & MAX31865_FAULT_REFINHIGH) {
+      DEBUGPRINTLN("REFIN- < 0.85 x Bias - FORCE- open"); 
+    }
+    if (fault & MAX31865_FAULT_RTDINLOW) {
+      DEBUGPRINTLN("RTDIN- < 0.85 x Bias - FORCE- open"); 
+    }
+    if (fault & MAX31865_FAULT_OVUV) {
+      DEBUGPRINTLN("Under/Over voltage"); 
+    }
+    thermo.clearFault();
+  }
+
+  ttt = thermo.temperature(RNOMINAL, RREF);
+
+#endif
   
   last_temp = ttt;
   return ttt;
@@ -1618,7 +1612,7 @@ void sauve_param()
   if (dataFile) {
 
     // Certaines informations ne sont présentes que pour le DAC
-    #if defined(DAC)
+    #if defined(ADS1015)
         dataFile.print("THERMPIN2");
         dataFile.print("=");
         dataFile.print(THERM_PIN2);
@@ -1707,18 +1701,13 @@ void sauve_param()
     dataFile.print("=");
     dataFile.print(PID_OFFSET);
     dataFile.print(",");
-    #if !(defined(DAC))
+    #if defined(DS18B20)
       dataFile.print("ONEWIRE00");
       dataFile.print("=");
       dataFile.print(ONE_WIRE_BUS);
       dataFile.print(",");
     #endif
-    #if (defined(DEUXSONDES))
-      dataFile.print("ONEWIRE02");
-      dataFile.print("=");
-      dataFile.print(ONE_WIRE_BUS2);
-      dataFile.print(",");
-    #endif
+
     dataFile.close();
   }
   digitalWrite(ledPin, 0);
