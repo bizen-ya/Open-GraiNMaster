@@ -30,20 +30,75 @@
 //bibliothèques
 #include <SPI.h>
 #include <SD.h>
+#include <ArduinoJson.h>
 #include <PID_v1.h> //gestion de l'algo PID
 #include <avr/pgmspace.h>
 #include "Timer.h" // gestion des timers
-#include <LiquidCrystal.h> //gestion du LCD
+#include <jm_LCM2004A_I2C.h> //gestion du LCD
 #include <avr/io.h>
 #include <avr/interrupt.h> //gestion des interruptions
+#include <Wire.h>
 
+// Json config
+struct Config {
+  //valeurs de l'hysteresis pour passage en PID fin ou grossier
+  byte hysteresis_Pos =  1;
+  byte hysteresis_Neg  = 1;
+  
+  String myPaliers[2][7] = {
+    {"Prechauffe", "Palier 1  ", "Palier 2  ", "Palier 3  ", "Palier 4  ", "Mash-out  ", "Ebullition"},   // Nom des paliers en version longue (10 caractères)
+    {"PREC",         "PAL1",     "PAL2",     "PAL3",     "PAL4",     "MOUT",     "EBUL"      }    // Nom des paliers en version courte (4 caractères)
+  };
+
+  float myTemperatures[7] = {
+    40,     // = thetastart, température de préchauffe de la cuve
+    40.25,  // = theta1, température empâtage céréales non maltées
+    52.5,   // = theta2, température protéines
+    62.0,   // = theta3, température de sacharification B amylase
+    68.75,  // = theta4, température de sacharification A amylase
+    75.75,  // = thetaMO, température de mash out
+    103.0   // = theta5, température d'ébullition
+  }; // Températures pour chaque myPaliers
+
+  byte myTempo[7] {
+    0,      // tempo_A, pour l'affichage temporaire
+    0,      // tempo1, palier empâtage céréales non maltées
+    15,     // tempo2, palier protéinique
+    35,     // tempo3, palier de sacharification B amylase
+    30,     // tempo4, palier de sacharification A amylase
+    5,      // palier de Mash Out
+    70      // tempo5, ébullition
+  }; // Temporisation pour chaque myPaliers
+
+  // Règlages par défaut du PID
+  // Ces constantes sont correctes pour une cuve de 27L 2500W non isolée type kitchen chef
+
+  byte P_strong = 100;
+  float I_strong = 0.0;
+  byte D_strong = 16;
+
+  byte P_weak = 80;
+  float I_weak = 0.02;
+  byte D_weak = 8;
+  
+  byte PID_OFFSET = 1; // on ruse le PID pour lui faire décaller la température cible d'une valeur constante par exemple +1° donc si l'utilisateur vise 62° et que la température mesurée est de 61° le PID croit qu'il a atteint les 62° et coupe la chauffe. Ainsi l'overshoot est limité.
+  // en théorie, avec les paramètres réglés au top, ce paramètre peut être remis à zéro.
+
+  byte Beep_PIN = 40; 
+  byte ledPin = 13;
+    
+};
+
+const char *filename = "/config.txt";  // <- SD library uses 8.3 filenames
+Config config;                         // <- global configuration object
+
+double Kp = config.P_strong; // multiplicateur de l'erreur différentielle de température.
+double Ki = config.I_strong; //coef de correction inverse
+double Kd = config.D_strong; //coef de dérivée
 
 #define DEBUG           // Décommenter pour afficher les informations de deboguage (PID sur le LCD)
-//#define ADS1015             // Décommenter pour utilisation du DAC (Version Originale)
-//#define DS18B20         // DS18B20
 #define MAX31865
-//#define BIPPEUR         // Commenter pour ne pas utiliser de buzzer
-//#define EEPROMRW        // Décommenter pour enregistrement sur l'EEPROM si pas de carte SD
+
 #define DEFIL           // Commenter pour ne pas faire alterner le texte sur la deuxième ligne pour afficher le temps restant total avant la fin de l'ébullition
 #define PIDDEBUG        // Commenter pour enlever l'information du PID sur l'écran lors de la chauffe
 
@@ -59,12 +114,7 @@
   #define DEBUGPRINTLN(x)
 #endif
 
-#ifdef EEPROMRW
-  #include <EEPROMex.h>
-  #include <EEPROMVar.h>  // gestion des enregistrements en EEPROM
-#endif
-
-#define BLINK() ledState = !ledState; digitalWrite(ledPin, ledState);
+#define BLINK() ledState = !ledState; digitalWrite(config.ledPin, ledState);
 
 #ifdef DEFIL
   bool defilement = 0;    // Position du défilement / 1 = température et température à atteindre / 0 = température et temps restant / s'échange à chaque écriture sur la carte SD, donc toutes les 10 s environ
@@ -73,16 +123,6 @@
 byte DETECT = 2 , GATE = 3; //Broches utilisées pour le pilotage du triac -> detect : impulsion du passage au point zéro, gate : gachette du triac
 byte PULSE = 4  ; //triac gate pulse : largeur de l'impulsion pour activer le triac, en nombre de cycles d'horloge
 int HALF_WAVE = 560;// //nombre de "tics" d'horloge à chaque demi onde 50Hz . 625 théoriques, mais 560 réels .
-
-#if defined(DS18B20) // Déclaration de la sonde de température DS18B20 si l'on n'utilise pas de DAC
-  #include <Wire.h>
-  #include <OneWire.h>
-  #include <DallasTemperature.h>
-
-  byte ONE_WIRE_BUS = 30;  // DS18B20 pin
-  OneWire oneWire(ONE_WIRE_BUS);
-  DallasTemperature DS18(&oneWire);
-#endif
 
 #if defined(MAX31865)
   #include <Adafruit_MAX31865.h>
@@ -100,48 +140,21 @@ int HALF_WAVE = 560;// //nombre de "tics" d'horloge à chaque demi onde 50Hz . 6
 #endif
 
 // constantes pour les touches reliées au module LCD
-#define btnRIGHT  0
-#define btnUP     1
-#define btnDOWN   2
-#define btnLEFT   3
-#define btnSELECT 4
-#define btnNONE   5
-
-#if defined(ADS1015)
-  #include <Adafruit_ADS1015.h> // gestion du CAN 16 bits
-  // pour la lecture de la sonde via le DAC (Version Originale)
-  byte THERM_PIN2  = 1 ;// entrée n°1 du dac 16bits
-  byte THERM_PIN  = 3 ; // entrée n°3 du dac 16bits
-  //on lit sur deux entrées dont les filtres passe bas sont légèrement différents, afin de faire une moyenne et augmenter la précision
-  
-  int OFFSET_PROBE  = 138; // correction constante de la température
-  int COEF_PROBE = 260 ; // correction proportionelle
-  // Température calculée = (mesure du DAC  - OFFSET_PROBE) / COEF_PROBE
-
-  // déclaration de l'ADC 16 bits - DAC pour température (Version Originale)
-  Adafruit_ADS1115 ads1115(0x48);  // ADC16 bits addresse 0x48
-/*
-  String variables_SD_DAC[] = {
-    "THERMPIN2",
-    "THERMPIN1",
-    "OFSETPRBE",
-    "COEFPROBE"
-  };
-*/
-#endif
-
-//valeurs de l'hysteresis pour passage en PID fin ou grossier
-byte hysteresis_Pos =  1;
-byte hysteresis_Neg  = 1;
+#define btnUP     22
+#define btnDOWN   23
+#define btnLEFT   24
+#define btnRIGHT  25
+#define btnSELECT 26
+#define btnNONE   0
 
 //  pins utilisées par le LCD
-LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
+jm_LCM2004A_I2C lcd(0x27);
 
 // valeurs utilisées pour configurer le LCD
 byte backLight   = 10;    // LCD Panel Backlight LED connected to digital pin 10
 int lcd_key     = 0;
 int adc_key_in  = 0;
-byte ledPin = 13;
+
 byte ledState = LOW;
 
 // variables du programme
@@ -160,31 +173,6 @@ unsigned long temps_pause = 0; //si le programme est en pause, compte le temps �
 bool palier_atteint = false;
 int logRecord_ID;   // Timer ID pour la fonction logRecord, pour un arrêt propre du programme (on veut le stopper avant d'arrêter le programme pour éviter toute écriture quand on ddébranche l'Arduino)
 
-String myPaliers[2][7] = {
-  {"Prechauffe", "Palier 1  ", "Palier 2  ", "Palier 3  ", "Palier 4  ", "Mash-out  ", "Ebullition"},   // Nom des paliers en version longue (10 caractères)
-  {"PREC",         "PAL1",     "PAL2",     "PAL3",     "PAL4",     "MOUT",     "EBUL"      }    // Nom des paliers en version courte (4 caractères)
-};
-
-float myTemperatures[] = {
-  40,     // = thetastart, température de préchauffe de la cuve
-  40.25,  // = theta1, température empâtage céréales non maltées
-  52.5,   // = theta2, température protéines
-  62.0,   // = theta3, température de sacharification B amylase
-  68.75,  // = theta4, température de sacharification A amylase
-  75.75,  // = thetaMO, température de mash out
-  103.0   // = theta5, température d'ébullition
-}; // Températures pour chaque myPaliers
-
-byte myTempo[] {
-  0,      // tempo_A, pour l'affichage temporaire
-  0,      // tempo1, palier empâtage céréales non maltées
-  15,     // tempo2, palier protéinique
-  35,     // tempo3, palier de sacharification B amylase
-  30,     // tempo4, palier de sacharification A amylase
-  5,      // palier de Mash Out
-  70      // tempo5, ébullition
-}; // Temporisation pour chaque myPaliers
-
 unsigned int cooling = 0; // compteur du temps de refroidissement
 
 float last_temp = 0; // dernière température positive
@@ -195,44 +183,19 @@ float last_temp = 0; // dernière température positive
 float tx_chauffe;
 float theta_PID, theta_mesure, theta_objectif = 20;
 
-// Règlages par défaut du PID
-// Ces constantes sont correctes pour une cuve de 27L 2500W non isolée type kitchen chef
-
-byte P_strong = 100;
-float I_strong = 0.0;
-byte D_strong = 16;
-
-byte P_weak = 80;
-float I_weak = 0.02;
-byte D_weak = 8;
-
-double Kp = P_strong; // multiplicateur de l'erreur différentielle de température.
-double Ki = I_strong; //coef de correction inverse
-double Kd = D_strong; //coef de dérivée
-
-byte PID_OFFSET = 1; // on ruse le PID pour lui faire décaller la température cible d'une valeur constante par exemple +1° donc si l'utilisateur vise 62° et que la température mesurée est de 61° le PID croit qu'il a atteint les 62° et coupe la chauffe. Ainsi l'overshoot est limité.
-// en théorie, avec les paramètres réglés au top, ce paramètre peut être remis à zéro.
-
 PID myPID((double*)&theta_PID, (double*)&tx_chauffe, (double*)&theta_objectif, Kp, Ki, Kd, DIRECT); //déclaration du PID
 
-#ifdef BIPPEUR
-    //pin du bipeur
-    byte Beep_PIN = 40;
-    // variables utilisées pour faire marcher le bippeur
-    #define BeepONState  LOW
-    #define BeepOFFState  HIGH
-    #define BeepON(s) BeepON(s)
-    byte beep_duration = 0;   // temps du bip : s / 128, 128 ms étant le temps entre chaque appel de sel_menu, la plus rapide des périodes pour vérifier que le bip est en route ou non 
-    void BeepON(unsigned int s) {
-      digitalWrite(Beep_PIN, BeepONState);
-      beep_duration = (byte) ceil(s / 128);   // la durée du bip est comptée par période de 128 ms (arrondies à l'entier supérieur) - sel_menu, qui va vérifier si le bip est en route ou non, est appelée toutes les 128 ms
-    }
-    void BeepOFF() {
-      digitalWrite(Beep_PIN, BeepOFFState);       
-    }
-#else
-    #define BeepON(s)
-#endif
+#define BeepONState  LOW
+#define BeepOFFState  HIGH
+#define BeepON(s) BeepON(s)
+byte beep_duration = 0;   // temps du bip : s / 128, 128 ms étant le temps entre chaque appel de sel_menu, la plus rapide des périodes pour vérifier que le bip est en route ou non 
+void BeepON(unsigned int s) {
+  digitalWrite(config.Beep_PIN, BeepONState);
+  beep_duration = (byte) ceil(s / 128);   // la durée du bip est comptée par période de 128 ms (arrondies à l'entier supérieur) - sel_menu, qui va vérifier si le bip est en route ou non, est appelée toutes les 128 ms
+}
+void BeepOFF() {
+  digitalWrite(config.Beep_PIN, BeepOFFState);       
+}
 
 
 //réglages des timers
@@ -243,7 +206,7 @@ File myFile;
 String datalogFile; // Fichier de log, à chaque brassage différent
 int check_data = 0;
 
-char degre = (char)223;  // char 223 = ° (signe degré)
+char degre = (char)176;  // char 176 = ° (signe degré) en unicode
 
 
 void setup()
@@ -254,27 +217,20 @@ void setup()
       DEBUGPRINTLN  ("Startup ok\n");
   #endif
   
-  #if defined(ADS1015)
-      // démarrage du DAC 16 bits
-      ads1115.begin(); // (Version Originale)
-  #endif
-
-
   #if defined(MAX31865)
-    DEBUGPRINTLN("Adafruit MAX31865 PT100 Sensor Test!");
+    DEBUGPRINTLN("Adafruit MAX31865 PT100");
     thermo.begin(MAX31865_2WIRE);  // set to 3WIRE or 4WIRE as necessary
   #endif
-
-  
+ 
   //config pour SD
   String inString = "";
   
-  pinMode(53, OUTPUT); //la pin 53 est normalement attribuée à la fonction SPI Slave Select (SS)Permet d'activer ou désactiver le périphérique
+  //pinMode(53, OUTPUT); //la pin 53 est normalement attribuée à la fonction SPI Slave Select (SS)Permet d'activer ou désactiver le périphérique
   // Suivant les modules SD, il peut être nécessaire de commenter cette ligne (c'est le cas de mon module même si c'est pas logique)
 
-
   // ECRAN DE PRESENTATION ----------------------------
-  lcd.begin(16, 2);     // déclaration de la bibliothèque LCD avec 16 caractères, 2 lignes
+  Wire.begin();
+  lcd.begin();
 
   // création des caractères spéciaux
   byte beer1[8] = {
@@ -300,6 +256,7 @@ void setup()
   lcd.createChar(1, beer2);
   CLS();           // fonction qui efface le LCD et met le curseur au début
   lcd.print("- GraiN.Master -");
+  DEBUGPRINTLN  ("Print ok\n");
   lcd.setCursor(0, 1);
   lcd.write(byte(0));
   lcd.write(byte(1));
@@ -308,19 +265,15 @@ void setup()
   lcd.write(byte(1));
   delay(2000);
 
-
   // set up des pins
   pinMode(DETECT, INPUT);     //détection du passage au pont zéro / zero cross detect
   digitalWrite(DETECT, HIGH); // enable pull-up resistor
   pinMode(GATE, OUTPUT);      //triac gate control
-  #if (defined(BIPPEUR))
-    pinMode(Beep_PIN, OUTPUT);  // Déclaration du bipper
-    BeepOFF();
-  #endif
-
+  pinMode(config.Beep_PIN, OUTPUT);  // Déclaration du bipper
+  
   pinMode(backLight, INPUT); //set backlight pin to input to avoid MCU overcurent on pin 10
   // pinMode(11, OUTPUT);     // pin11 = MOSI sur uno
-  pinMode(ledPin, OUTPUT);
+  pinMode(config.ledPin, OUTPUT);
 
   // set up Timer1
   //(see ATMEGA 328 data sheet pg 134 for more details)
@@ -331,15 +284,11 @@ void setup()
 
   myPID.SetOutputLimits(0, 255);
 
-  #if (defined(EEPROMRW))
-      EEPROM.setMaxAllowedWrites(48);
-  #endif
-
   // pinMode(10, OUTPUT);
   CLS();          // move cursor to beginning of line "0"
   lcd.print("initialise  SD  "); // print a simple message
   delay(600);
-  if (!SD.begin(4)) {
+  if (!SD.begin(53)) {
     lcd.home();           // move cursor to beginning of line "0"
     lcd.print("ERREUR SD CARD "); // print a simple message
     delay(6000);
@@ -348,241 +297,29 @@ void setup()
   CLS();           // move cursor to beginning of line "0"
   lcd.print(" Lecture  param "); // print a simple message
 
-  if (SD.exists("setup.grm")) {
+  if( SD.exists(filename)) {
 
-    lcd.setCursor(0, 1);
-    lcd.print(" sur carte SD ");
-    delay(1500);
-
-    myFile = SD.open("setup.grm");
-
-    while (myFile.available()) {
-      int inChar = myFile.read();
-      if ((inChar != ',')) {
-        inString += (char)inChar;
-      } //fin if alphanum
-
-      else { //on a récupéré la première ligne sous forme "variable=000.00"
-        //        Serial.print("Input string: \n");
-        //       Serial.print(inString);
-
-        if (inString.startsWith("THERMPIN2"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-
-          #if defined(ADS1015)
-              THERM_PIN2 = inString.toInt();
-          #endif
-          check_data++;
-
-        }
-
-        if (inString.startsWith("THERMPIN1"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          #if defined(ADS1015)
-              THERM_PIN = inString.toInt();
-          #endif
-          check_data++;
-
-        }
-        if (inString.startsWith("OFSETPRBE"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          #if defined(ADS1015)
-              OFFSET_PROBE = inString.toInt();
-          #endif
-          check_data++;
-        }
-
-        if (inString.startsWith("COEFPROBE"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          #if defined(ADS1015)
-              COEF_PROBE = inString.toInt();
-          #endif
-          check_data++;
-
-        }
-
-        if (inString.startsWith("hysterPos"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          hysteresis_Pos = inString.toInt();
-          check_data++;
-
-        }
-        if (inString.startsWith("hysterNeg"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          hysteresis_Neg = inString.toInt();
-          check_data++;
-
-        }
-        
-        for (int i = 0; i < 7; i++) {
-          if (inString.startsWith(myPaliers[0][i])) {   // Température (de préchauffage ou de palier)
-                  DEBUGPRINTLN("Reading " + myPaliers[0][i] + " temperature:");
-                  inString.remove(0, 10); // Remove 10 characters starting at index=0
-                  DEBUGPRINTLN(inString.toFloat());
-                  myTemperatures[i] = inString.toFloat();
-                  check_data++;
-          }
-
-          if (inString.startsWith(myPaliers[1][i] + "TEMPO")) {  // Temporisation pour chaque palier
-                  DEBUGPRINTLN("Reading " + myPaliers[0][i] + " timing:");
-                  inString.remove(0, 10); // Remove 10 characters starting at index=0
-                  DEBUGPRINTLN(inString.toInt());
-                  myTempo[i] = inString.toInt();
-                  check_data++;
-          }
-
-        }
-
-        if (inString.startsWith("Pstrong00"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          P_strong = inString.toFloat();
-          check_data++;
-
-        }
-
-        if (inString.startsWith("Istrong00"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          I_strong = inString.toFloat();
-          check_data++;
-
-        }
-        if (inString.startsWith("Dstrong00"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          D_strong = inString.toFloat();
-          check_data++;
-
-        }
-
-        if (inString.startsWith("Pweak0000"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          P_weak = inString.toFloat();
-          check_data++;
-
-        }
-
-        if (inString.startsWith("Iweak0000"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          I_weak = inString.toFloat();
-          check_data++;
-
-        }
-        if (inString.startsWith("Dweak0000"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          D_weak = inString.toFloat();
-          check_data++;
-
-        }
-
-        if (inString.startsWith("LEDPIN000"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          ledPin = inString.toInt();
-          check_data++;
-
-        }
-        if (inString.startsWith("GATE00000"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          GATE = inString.toInt();
-          check_data++;
-
-        }
-        if (inString.startsWith("PULSE0000"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          PULSE = inString.toInt();
-          check_data++;
-
-        }
-        if (inString.startsWith("HALFWAVE0"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          HALF_WAVE = inString.toInt();
-          check_data++;
-
-        }
-        if (inString.startsWith("BEEPPIN00"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          #if (defined(BIPPEUR))
-            Beep_PIN = inString.toInt();
-          #endif
-          check_data++;
-
-        }
-        if (inString.startsWith("PIDOFFSET"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          PID_OFFSET = inString.toInt();
-          check_data++;
-
-        }
-
-        if (inString.startsWith("ONEWIRE00"))
-        {
-          inString.remove(0, 10); // Remove 10 characters starting at index=0
-          #if defined(DS18B20)
-              ONE_WIRE_BUS = inString.toInt();
-          #endif
-          check_data++;
-        }
-
-        inString = "";
-
-      } //fin else
-
-
-    } //fin while
-
-
-    CLS();
-    lcd.print(check_data);
-    lcd.setCursor(0, 1);
-    lcd.print("parametres lus ");
-    myFile.close();
-    delay(1500);
+  // Should load default config if run for the first time
+  Serial.println(F("Loading configuration..."));
+  loadConfiguration(filename, config);
   }
-  else {
-    // Pas possible de lire sur la carte SD --> on lit sur l'EEPROM si c'est défini...
-    #if (defined(EEPROMRW))
-        lcd.setCursor(0, 1);
-        lcd.print(" sur EEPROM ");
-        delay(1500);
-        myTempo[1] = EEPROM.readLong(0);
-        myTempo[2] = EEPROM.readLong(7);
-        myTempo[3] = EEPROM.readLong(15);
-        myTempo[4] = EEPROM.readLong(23);
-        myTempo[6] = EEPROM.readLong(31);
-        myTemperatures[1] = EEPROM.readFloat(39);
-        myTemperatures[2] = EEPROM.readFloat(47);
-        myTemperatures[3] = EEPROM.readFloat(55);
-        myTemperatures[4] = EEPROM.readFloat(63);
-        myTemperatures[6] = EEPROM.readFloat(71);
-        myTemperatures[5] = EEPROM.readFloat(79);
-        myTemperatures[0] = EEPROM.readFloat(87);
-    #else     // sinon on reste sur les valeurs par défaut définies en dur dans le programme
-        lcd.setCursor(0, 1);
-        lcd.print("  par defaut  ");
-        delay(1500);
-    #endif
-  }
+  else
+  {
+  
+  // Create configuration file
+  Serial.println(F("Saving configuration..."));
+  saveConfiguration(filename, config);
 
+  }
+  
+  // Dump config file
+  Serial.println(F("Print config file..."));
+  printFile(filename);
+  
   datalogFile = "log" + String(random(0, 99999)) + ".txt"; // Le nom du fichier, avec un numéro pseudo-aléatoire pour éviter de réécrire sur le même à chaque brassin
   DEBUGPRINTLN("Datalogfile = " + datalogFile);
 
-  digitalWrite(ledPin, 1);
+  digitalWrite(config.ledPin, 1);
   File dataFile = SD.open(datalogFile, FILE_WRITE);
   if (dataFile) {
     dataFile.print("Temps (secondes)");
@@ -597,8 +334,15 @@ void setup()
     dataFile.print('\n');
     dataFile.close();
   }
-  digitalWrite(ledPin, 0);
+  digitalWrite(config.ledPin, 0);
 
+  // setup buttons
+  pinMode(btnUP, INPUT_PULLUP);
+  pinMode(btnDOWN, INPUT_PULLUP);
+  pinMode(btnLEFT, INPUT_PULLUP);
+  pinMode(btnRIGHT, INPUT_PULLUP);
+  pinMode(btnSELECT, INPUT_PULLUP);
+  
   T.every(2205, lecture); // constante de temps pour le timer 1 - lecture de la sonde
   T.every(128, sel_menu); // constante de temps pour le timer 2 - lecture des touches
   T.every(1024, LCD_upd); // timer 3 - mise à jour écran
@@ -656,39 +400,39 @@ void loop()
 
 // Sélection de la température et du temps du palier
 void paliers_temp(int numpalier, String *line1, String *line2) {
-        *line1 = myPaliers[0][numpalier] + " ?";
+        *line1 = config.myPaliers[0][numpalier] + " ?";
         if (submenu == 0) {
-          *line2 = ">T:" + String(myTemperatures[numpalier]) + degre + "  " + String(myTempo[numpalier]) + " min";
+          *line2 = ">T:" + String(config.myTemperatures[numpalier]) + degre + "  " + String(config.myTempo[numpalier]) + " min";
         }
         else {
-          *line2 = " T:" + String(myTemperatures[numpalier]) + degre + " >" + String(myTempo[numpalier]) + " min";
+          *line2 = " T:" + String(config.myTemperatures[numpalier]) + degre + " >" + String(config.myTempo[numpalier]) + " min";
         }
 }
 
 // Sauter le palier en cours
 void pass_palier(int numpalier, String *line1, String *line2) {
-        *line1 = "SAUTER " + myPaliers[0][numpalier] + " ?";
+        *line1 = "SAUTER " + config.myPaliers[0][numpalier] + " ?";
         *line2 = "SEL=OUI autre=NO";
 }
 
 // Annuler le palier en cours
 void restart_palier(int numpalier, String *line1, String *line2) {
-        *line1 = "RESTART " + myPaliers[0][numpalier] + " ?";
+        *line1 = "RESTART " + config.myPaliers[0][numpalier] + " ?";
         *line2 = "SEL=OUI autre=NO";  
 }
 
 void display_palier(int numpalier, String *line1, String *line2) {
   unsigned int t = 0;
   // L'objectif de température est celui du palier en cours
-  theta_objectif = myTemperatures[numpalier];
+  theta_objectif = config.myTemperatures[numpalier];
   // On ajoute tous les temps des paliers pour connaître le temps restant
   for (int i = 1; i <= numpalier; i++) {
-    t += myTempo[i];
+    t += config.myTempo[i];
   }
   DEBUGPRINTLN("t : " + String(t) + " / minutes : " + String(minutes));
   // Si le temps n'est pas dépassé (t = temps total qu'il faut atteindre depuis le premier palier jusqu'à celui en cours)
   if (t > minutes) {
-    myTempo[0] = t - minutes;
+    config.myTempo[0] = t - minutes;
   }
   else {  // le palier est fini : on saute au palier suivant automatiquement
     jump = 1;  
@@ -696,17 +440,17 @@ void display_palier(int numpalier, String *line1, String *line2) {
     palier_atteint = false;
     return;
   }
-  *line1 = myPaliers[1][numpalier] + "(" + String(myTempo[numpalier]) + ")";
+  *line1 = config.myPaliers[1][numpalier] + "(" + String(config.myTempo[numpalier]) + ")";
   
   // on affiche un caractère différent s'il y a chauffe (">") ou si le palier a déjà été atteint (":")
   if (palier_atteint) {
-    *line1 = *line1 + ":" + String(myTempo[0]) + " min";
+    *line1 = *line1 + ":" + String(config.myTempo[0]) + " min";
   }
   else {
-    *line1 = *line1 + ">" + String(myTempo[0]) + " min";
+    *line1 = *line1 + ">" + String(config.myTempo[0]) + " min";
   }
 
-  *line2 = String((int)theta_mesure) + "/" + String((int)myTemperatures[numpalier]);
+  *line2 = String((int)theta_mesure) + "/" + String((int)config.myTemperatures[numpalier]);
 #ifdef DEFIL
   if (defilement) { // on affiche alternativement la température en cours et la température à atteindre, ou...
 #endif
@@ -717,9 +461,9 @@ void display_palier(int numpalier, String *line1, String *line2) {
   else {  // ... la température en cours et le temps total restant estimé avant la fin de l'ébullition, sans le temps inter-palier néanmoins
       t = 0;
       for (int i = numpalier + 1; i <= 6; i++) {
-        t += myTempo[i];
+        t += config.myTempo[i];
       }
-      t += myTempo[0];
+      t += config.myTempo[0];
       *line2 = *line2 + " REST:" + String(t) + "min";
   }
 #endif
@@ -735,8 +479,8 @@ void LCD_upd() // affiche les infos à l'écran ********************************
   {
     case 0:   // Sélection de température de préchauffage
       {
-        Ligne1 = myPaliers[0][menu] + " ?";
-        Ligne2 = ">T" + String(myTemperatures[0]) + degre + "C";
+        Ligne1 = config.myPaliers[0][menu] + " ?";
+        Ligne2 = ">T" + String(config.myTemperatures[0]) + degre + "C";
         break;
       }
 
@@ -763,9 +507,9 @@ void LCD_upd() // affiche les infos à l'écran ********************************
 
     case 8:   // préchauffage
     {
-      theta_objectif = myTemperatures[0];
-      Ligne1 = myPaliers[1][0];
-      Ligne2 = String((int)theta_mesure) + "/" + String((int)myTemperatures[0]) + degre + "C ";
+      theta_objectif = config.myTemperatures[0];
+      Ligne1 = config.myPaliers[1][0];
+      Ligne2 = String((int)theta_mesure) + "/" + String((int)config.myTemperatures[0]) + degre + "C ";
       Ligne2 = Ligne2 PID_DEBUG("PID:" + String(tx_chauffe)); // Ne va s'ajouter que si on active la fonction de debug (désactivation : commenter #define DEBUG)
       break;
     }
@@ -785,8 +529,8 @@ void LCD_upd() // affiche les infos à l'écran ********************************
       {
         Ligne1 = "Refroidissement";
         theta_objectif = 0;
-        myTempo[0] = (minutes - cooling);
-        Ligne2 = "T:" + String(((int)theta_mesure)) + degre + " / " + String(myTempo[0]) + " min";
+        config.myTempo[0] = (minutes - cooling);
+        Ligne2 = "T:" + String(((int)theta_mesure)) + degre + " / " + String(config.myTempo[0]) + " min";
         break;
       }
 
@@ -832,26 +576,36 @@ void LCD_upd() // affiche les infos à l'écran ********************************
       }
 
   }
+
+  // padding with nothing
+  char Char1[21];
+  char Char2[21];
+
+  sprintf(Char1,"%-20s",Ligne1.c_str());
+  sprintf(Char2,"%-20s",Ligne2.c_str());
+  
   lcd.setCursor(0, 0);
-  lcd.print(Ligne1);
+  lcd.print(Char1);
   lcd.setCursor(0, 1);
-  lcd.print(Ligne2);
+  lcd.print(Char2);
 
 } //************************************************************************************************************************************************************************FIN LCD
 
 // read the buttons
 int read_LCD_buttons() //cette fonction renvoie la touche appuyée
 {
-  adc_key_in = analogRead(0);      // read the value from the sensor
-  // my [Mark Bramwell's] buttons when read are centered at these valies: 0, 144, 329, 504, 741
-  // we add approx 50 to those values and check to see if we are close
-  // DEBUGPRINTLN(String(adc_key_in));
-  if (adc_key_in > 1000) return btnNONE; // We make this the 1st option for speed reasons since it will be the most likely result
-  if (adc_key_in < 50)   return btnRIGHT;
-  if (adc_key_in < 195)  return btnUP;
-  if (adc_key_in < 380)  return btnDOWN;
-  if (adc_key_in < 555)  return btnLEFT;
-  if (adc_key_in < 790)  return btnSELECT;
+  int btnUPValue = digitalRead(btnUP);
+  int btnDOWNValue = digitalRead(btnDOWN);
+  int btnLEFTValue = digitalRead(btnLEFT);
+  int btnRIGHTValue = digitalRead(btnRIGHT);
+  int btnSELECTValue = digitalRead(btnSELECT);
+
+  if (btnUPValue == LOW)   return btnUP;
+  if (btnDOWNValue == LOW)  return btnDOWN;
+  if (btnLEFTValue == LOW)  return btnLEFT;
+  if (btnRIGHTValue == LOW)  return btnRIGHT;
+  if (btnSELECTValue == LOW)  return btnSELECT;
+  
   return btnNONE;  // when all others fail, return this...
 } // fin read the buttons
 
@@ -860,30 +614,6 @@ float gettemp()
   myPID.Compute(); //on Lance un calcul du PID. le calcul se fait en même temps que le rafraichissement des variables de température
 
   float ttt;
-
-// Version Originale avec DAC
-  #if defined(ADS1015)
-        int16_t therm, therm2;
-        float ttt2;       // Le DAC à 2 entrées reliées à la même sonde. Pour déparasiter, on fait une moyenne des deux lectures
-        therm = ads1115.readADC_SingleEnded(THERM_PIN);
-        therm2 = ads1115.readADC_SingleEnded(THERM_PIN2);
-        therm -= OFFSET_PROBE;
-        therm2 -= OFFSET_PROBE;
-        ttt = float(therm);
-        ttt2 = float(therm2);
-        ttt = ttt / COEF_PROBE;
-        ttt2 = ttt2 / COEF_PROBE;
-        ttt = (ttt + ttt2) / 2;
-  #endif
-  
-  #if defined(DS18B20)
-        DS18.requestTemperatures(); 
-        ttt = DS18.getTempCByIndex(0);
-        // La sonde est dans les choux (on lit 0° ou -127°) 
-        if (ttt < 1) {
-           ttt = last_temp;   // on prend la dernière valeur qui était cohérente
-        }
-  #endif
 
 #if defined(MAX31865)
   uint16_t rtd = thermo.readRTD();
@@ -924,13 +654,11 @@ float gettemp()
   return ttt;
 }
 
-
 void CLS() // efface l'écran et place le curseur au début de la première ligne
 {
   lcd.clear();
   lcd.setCursor(0, 0);
 }
-
 
 void horloge() //fonction appelée une fois par seconde . On profite de cette fonction pour certaines fonctionalités actualisées une fois par seconde
 {
@@ -960,17 +688,17 @@ void horloge() //fonction appelée une fois par seconde . On profite de cette fo
         }
   }
   
-  if (theta_mesure > (theta_objectif - hysteresis_Neg) && theta_mesure < (theta_objectif + hysteresis_Pos)) // si on est compris entre les deux valeurs d'hysteresis, on est dans la bonne plage de température. on réduit la force du PID
+  if (theta_mesure > (theta_objectif - config.hysteresis_Neg) && theta_mesure < (theta_objectif + config.hysteresis_Pos)) // si on est compris entre les deux valeurs d'hysteresis, on est dans la bonne plage de température. on réduit la force du PID
   {
-    Kp = P_weak; // multiplicateur de l'erreur différentielle de température.
-    Ki = I_weak; //coef de correction intégrale
-    Kd = D_weak; //coef de dérivée
+    Kp = config.P_weak; // multiplicateur de l'erreur différentielle de température.
+    Ki = config.I_weak; //coef de correction intégrale
+    Kd = config.D_weak; //coef de dérivée
    
   }
   else {
-    Kp = P_strong; // multiplicateur de l'erreur différentielle de température. 1° d'écart = Kp% de chauffe
-    Ki = I_strong; //coef de correction intégrale
-    Kd = D_strong; //coef de dérivée
+    Kp = config.P_strong; // multiplicateur de l'erreur différentielle de température. 1° d'écart = Kp% de chauffe
+    Ki = config.I_strong; //coef de correction intégrale
+    Kd = config.D_strong; //coef de dérivée
   }
   myPID.SetTunings(Kp, Ki, Kd);
 }
@@ -978,14 +706,14 @@ void horloge() //fonction appelée une fois par seconde . On profite de cette fo
 void lecture()
 {
   theta_mesure = gettemp();
-  if (theta_mesure > (theta_objectif - hysteresis_Neg) && theta_mesure < (theta_objectif + hysteresis_Pos)) {
+  if (theta_mesure > (theta_objectif - config.hysteresis_Neg) && theta_mesure < (theta_objectif + config.hysteresis_Pos)) {
     theta_PID = theta_mesure; // si on est proche de la température de consigne, on supprime l'offset de sécurité
     palier_atteint = true;    // on annonce que le palier est atteint : c'est lui qui va déterminer si on va incrémenter les minutes pour le palier en cours, pour éviter les erreurs de mesure de la sonde
   }
   else {
     // Si on n'est pas à l'ébullition...
     if (menu != 14) {
-      theta_PID = theta_mesure + PID_OFFSET;
+      theta_PID = theta_mesure + config.PID_OFFSET;
     } else {
       theta_PID = theta_mesure;
     }
@@ -994,7 +722,7 @@ void lecture()
 }
 
 void start_brew() {
-    digitalWrite(ledPin, LOW);
+    digitalWrite(config.ledPin, LOW);
     myPID.SetMode(AUTOMATIC);
 
     //////////////////////////////////
@@ -1002,8 +730,8 @@ void start_brew() {
     startprog = 1;
     total_time = 0;
     for (int i = 1; i < 7; i++) {
-      total_time += myTempo[i];
-      DEBUGPRINTLN("Temps palier[" + String(i) + "] : " + String(myTempo[i]));
+      total_time += config.myTempo[i];
+      DEBUGPRINTLN("Temps palier[" + String(i) + "] : " + String(config.myTempo[i]));
     }
     DEBUGPRINTLN("Temps total prévu : " + String(total_time));
     CLS();           // move to position 0 on the first line
@@ -1018,7 +746,7 @@ void start_brew() {
     lcd.print(" min");
     delay(1000);
 
-    digitalWrite(ledPin, LOW);
+    digitalWrite(config.ledPin, LOW);
 
     menu = 8; //saute au menu suivant (départ programme)
     CLS();
@@ -1030,15 +758,7 @@ void start_brew() {
 // +++++++++++++++++++++++++++++++++++++++++       GESTION DES MENUS                   ++++++++++++++++++++++++++++++++++++++++++++++
 void sel_menu()
 {
-  #ifdef BIPPEUR
-    if (beep_duration > 0) {
-      beep_duration--;
-    }
-    else {
-      BeepOFF();
-    }
-  #endif
-  
+ 
   byte m;
   
   lcd_key = read_LCD_buttons();  // read the buttons
@@ -1077,11 +797,11 @@ void sel_menu()
                 minutes = 0;  //avant le palier 1 (donc l'étape de préchauffage) le temps écoulé était à 0, et
                               //avant le palier 2 (donc le palier 1) le temps écoulé était aussi égal à 0
 
-                myTempo[0] = 0;
+                config.myTempo[0] = 0;
                 
 
                 for (int i = m; i >= 2; i--) { // on ne réinitialise les minutes que pour les paliers > 1
-                    minutes += myTempo[(i - 1)];    // on rajoute les durées des paliers précédents uniquement, car on recommence au début du palier m
+                    minutes += config.myTempo[(i - 1)];    // on rajoute les durées des paliers précédents uniquement, car on recommence au début du palier m
                 }
                 cooling = minutes;                
                 delay(150);
@@ -1110,9 +830,9 @@ void sel_menu()
                 m = menu - 208;
                 minutes = 0;
                 for (int i = m; i >= 1; i--) { // on ne réinitialise les minutes que pour les paliers > 1
-                    minutes += myTempo[i];    // on rajoute les durées des paliers précédents et du palier en cours, car on va recommencer au début du palier m + 1
+                    minutes += config.myTempo[i];    // on rajoute les durées des paliers précédents et du palier en cours, car on va recommencer au début du palier m + 1
                 }                
-                myTempo[0] = 0;
+                config.myTempo[0] = 0;
                 jump = 0;
                 annuler = 1;
                 cooling = minutes; // sauter l'étape ébullition (cooling sera mis à jour de toute façon quand on sera à la fin de l'ébullition, pas de problème à l'écraser maintenant)
@@ -1240,10 +960,10 @@ void sel_menu()
             case 6: // ébullition
             {
                 if (submenu == 0) {
-                  if (myTemperatures[menu] > 20) myTemperatures[menu] -= 0.5;
+                  if (config.myTemperatures[menu] > 20) config.myTemperatures[menu] -= 0.5;
                 }
                 else {
-                  if (myTempo[menu] > 0) myTempo[menu]--;
+                  if (config.myTempo[menu] > 0) config.myTempo[menu]--;
                 }
                 LCD_upd();
                 break;
@@ -1264,10 +984,10 @@ void sel_menu()
                 m = menu - 8;
                 DEBUGPRINTLN("Valeur submenu pour le menu " + String(m) + " : " + String(submenu));
                 if (submenu == 0) {
-                  if (myTemperatures[m] > 20) myTemperatures[m] -= 0.5;
+                  if (config.myTemperatures[m] > 20) config.myTemperatures[m] -= 0.5;
                 }
                 else {
-                  if (myTempo[m] > 2) myTempo[m]--;
+                  if (config.myTempo[m] > 2) config.myTempo[m]--;
                 }
                 LCD_upd();
                 break;
@@ -1295,10 +1015,10 @@ void sel_menu()
             case 6: // ébullition
             {
                 if (submenu == 0) {
-                  if (myTemperatures[menu] <= 110) myTemperatures[menu] += 0.5;
+                  if (config.myTemperatures[menu] <= 110) config.myTemperatures[menu] += 0.5;
                 }
                 else {
-                  myTempo[menu]++;
+                  config.myTempo[menu]++;
                 }
                 LCD_upd();
                 break;
@@ -1321,10 +1041,10 @@ void sel_menu()
                 m = menu - 8;
                 DEBUGPRINTLN("Valeur submenu pour le menu " + String(m) + " : " + String(submenu));
                 if (submenu == 0) {
-                  if (myTemperatures[m] < 110) myTemperatures[m] += 0.5;
+                  if (config.myTemperatures[m] < 110) config.myTemperatures[m] += 0.5;
                 }
                 else {
-                  myTempo[m]++;
+                  config.myTempo[m]++;
                 }
                 LCD_upd();
                 break;
@@ -1373,24 +1093,9 @@ void sel_menu()
             case 7: // sauvegarde
               {
 
-                digitalWrite(ledPin, HIGH);
-                // sauvegarde des variables dans l'EEPROM si défini :
-                #if (defined(EEPROMRW))
-                    EEPROM.updateLong(0, myTempo[1]);
-                    EEPROM.updateLong(7, myTempo[2]);
-                    EEPROM.updateLong(15, myTempo[3]);
-                    EEPROM.updateLong(23, myTempo[4]);
-                    EEPROM.updateLong(31, myTempo[6]);
-                    EEPROM.updateFloat(39, myTemperatures[1]);
-                    EEPROM.updateFloat(47, myTemperatures[2]);
-                    EEPROM.updateFloat(55, myTemperatures[3]);
-                    EEPROM.updateFloat(63, myTemperatures[4]);
-                    EEPROM.updateFloat(71, myTemperatures[6]);
-                    EEPROM.updateFloat(79, myTemperatures[5]);
-                    EEPROM.updateFloat(87, myTemperatures[0]);
-                #endif
-                
-                sauve_param();
+                digitalWrite(config.ledPin, HIGH);
+
+                saveConfiguration(filename, config);
 
                 myFile = SD.open(datalogFile, FILE_WRITE);
                 DEBUGPRINTLN("Write on " + datalogFile);
@@ -1398,14 +1103,14 @@ void sel_menu()
                   myFile.print("----GraiN.Master----\n");
                   myFile.print(version);
                   myFile.print("\nTempérature de départ : ");
-                  myFile.print(myTemperatures[0]);
+                  myFile.print(config.myTemperatures[0]);
                   myFile.print("°C\n");
 
                   for (int i = 1; i < 7; i++) {
-                    myFile.print(myPaliers[0][i]);
-                    myFile.print(myTempo[i]);
+                    myFile.print(config.myPaliers[0][i]);
+                    myFile.print(config.myTempo[i]);
                     myFile.print(" min - ");
-                    myFile.print(myTemperatures[i]);
+                    myFile.print(config.myTemperatures[i]);
                     myFile.print("°C\n");
                   }
 
@@ -1417,12 +1122,12 @@ void sel_menu()
                 DEBUGPRINTLN("----GraiN.Master----\n");
                 DEBUGPRINTLN(version);
                 DEBUGPRINTLN("\nTempérature de départ : ");
-                DEBUGPRINTLN(myTemperatures[0]);
+                DEBUGPRINTLN(config.myTemperatures[0]);
                 DEBUGPRINTLN("°C\n");
                 #ifdef DEBUG
                 for (int i = 1; i < 7; i++) {
-                  DEBUGPRINTLN(myPaliers[0][i]);
-                  DEBUGPRINTLN(String(myTempo[i]) + " min - " + String(myTemperatures[i]) + "°C");
+                  DEBUGPRINTLN(config.myPaliers[0][i]);
+                  DEBUGPRINTLN(String(config.myTempo[i]) + " min - " + String(config.myTemperatures[i]) + "°C");
                 }
                 #endif                
                 lcd.home();           // move to position 0 on the first line
@@ -1573,13 +1278,13 @@ void logRecord()
   else if (menu <= 7)
     numpalier = 0;
   else numpalier = menu - 8;
-  digitalWrite(ledPin, 1);
+  digitalWrite(config.ledPin, 1);
   File dataFile = SD.open(datalogFile, FILE_WRITE);
   if (dataFile) {
     dataFile.print(secondes_reel);
     dataFile.print(";");
     if (numpalier != 7)
-      dataFile.print(myPaliers[0][numpalier]);
+      dataFile.print(config.myPaliers[0][numpalier]);
     else dataFile.print("Refroidissement");
     dataFile.print(";");
     dataFile.print(theta_objectif);
@@ -1590,125 +1295,110 @@ void logRecord()
     dataFile.print('\n');
     dataFile.close();
   }
-  digitalWrite(ledPin, 0);
+  digitalWrite(config.ledPin, 0);
   DEBUGPRINTLN("Secondes réelles depuis le début : " + String(secondes_reel));
   DEBUGPRINTLN("Theta_Objectif : " + String(theta_objectif));
   DEBUGPRINTLN("Theta_mesure : " + String(theta_mesure));
   DEBUGPRINTLN("Taux chauffe (PID) : " + String(tx_chauffe));
-  CLS();                      // On ne refresh l'écran que toutes les 10 secondes, pour éviter l'effet stroboscopique
+  //CLS();                      // On ne refresh l'écran que toutes les 10 secondes, pour éviter l'effet stroboscopique
   
 }
 
 
-void sauve_param()
-{
-  digitalWrite(ledPin, 1);
 
-  if (SD.exists("setup.grm")) {
-    SD.remove("setup.grm");
+
+// Loads the configuration from a file
+void loadConfiguration(const char *filename, Config &config) {
+  // Open file for reading
+  File file = SD.open(filename);
+
+  // Allocate a temporary JsonDocument
+  // Don't forget to change the capacity to match your requirements.
+  // Use arduinojson.org/v6/assistant to compute the capacity.
+  StaticJsonDocument<4096> doc;
+
+  // Deserialize the JSON document
+  DeserializationError error = deserializeJson(doc, file);
+  if (error)
+    Serial.println(F("Failed to read file, using default configuration"));
+
+  // Copy values from the JsonDocument to the Config
+  config.hysteresis_Pos = doc["hysteresis_Pos"];
+  config.hysteresis_Neg = doc["hysteresis_Neg"];
+  copyArray( doc["myPaliers"] , config.myPaliers );
+  copyArray( doc["myTemperatures"], config.myTemperatures );
+  copyArray( doc["myTempo"], config.myTempo );
+  config.P_strong =  doc["P_strong"];
+  config.I_strong =  doc["I_strong"];
+  config.D_strong =  doc["D_strong"];
+  config.P_weak = doc["P_weak"];
+  config.I_weak = doc["I_weak"];
+  config.D_weak = doc["D_weak"];
+  config.PID_OFFSET = doc["PID_OFFSET"];
+  config.Beep_PIN = doc["Beep_PIN"];
+  config.ledPin = doc["ledPin"];
+  
+  // Close the file (Curiously, File's destructor doesn't close the file)
+  file.close();
+}
+
+// Saves the configuration to a file
+void saveConfiguration(const char *filename, const Config &config) {
+  // Delete existing file, otherwise the configuration is appended to the file
+  SD.remove(filename);
+
+  // Open file for writing
+  File file = SD.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.println(F("Failed to create file"));
+    return;
   }
 
-  File dataFile = SD.open("setup.grm", FILE_WRITE);
-  if (dataFile) {
+  // Allocate a temporary JsonDocument
+  // Don't forget to change the capacity to match your requirements.
+  // Use arduinojson.org/assistant to compute the capacity.
+  StaticJsonDocument<4096> doc;
 
-    // Certaines informations ne sont présentes que pour le DAC
-    #if defined(ADS1015)
-        dataFile.print("THERMPIN2");
-        dataFile.print("=");
-        dataFile.print(THERM_PIN2);
-        dataFile.print(",");
-        dataFile.print("THERMPIN1");
-        dataFile.print("=");
-        dataFile.print(THERM_PIN);
-        dataFile.print(",");
-        dataFile.print("OFSETPRBE");
-        dataFile.print("=");
-        dataFile.print(OFFSET_PROBE);
-        dataFile.print(",");
-        dataFile.print("COEFPROBE");
-        dataFile.print("=");
-        dataFile.print(COEF_PROBE);
-        dataFile.print(",");
-    #endif
-    dataFile.print("hysterPos");
-    dataFile.print("=");
-    dataFile.print(hysteresis_Pos);
-    dataFile.print(",");
-    dataFile.print("hysterNeg");
-    dataFile.print("=");
-    dataFile.print(hysteresis_Neg);
-    dataFile.print(",");
-    dataFile.print(myPaliers[0][0]);
-    dataFile.print(myTemperatures[0]);
-    dataFile.print(",");
-    for (int i = 1; i < 7; i++) {
-      dataFile.print(myPaliers[0][i]);
-      dataFile.print(myTemperatures[i]);
-      dataFile.print(",");
-      dataFile.print(myPaliers[1][i] + "TEMPO");
-      dataFile.print("=");
-      dataFile.print(myTempo[i]);
-      dataFile.print(",");
-    }
+  // Set the values in the document
+  doc["hysteresis_Pos"] = config.hysteresis_Pos;
+  doc["hysteresis_Neg"] = config.hysteresis_Neg;
+  copyArray( config.myPaliers, doc["myPaliers"] );
+  copyArray( config.myTemperatures, doc["myTemperatures"] );
+  copyArray( config.myTempo, doc["myTempo"] );
+  doc["P_strong"] = config.P_strong;
+  doc["I_strong"] = config.I_strong;
+  doc["D_strong"] = config.D_strong;
+  doc["P_weak"] = config.P_weak;
+  doc["I_weak"] = config.I_weak;
+  doc["D_weak"] = config.D_weak;
+  doc["PID_OFFSET"] = config.PID_OFFSET;
+  doc["Beep_PIN"] = config.Beep_PIN;
+  doc["ledPin"] = config.ledPin;
 
-    dataFile.print("Pstrong00");
-    dataFile.print("=");
-    dataFile.print(P_strong);
-    dataFile.print(",");
-    dataFile.print("Istrong00");
-    dataFile.print("=");
-    dataFile.print(I_strong);
-    dataFile.print(",");
-    dataFile.print("Dstrong00");
-    dataFile.print("=");
-    dataFile.print(D_strong);
-    dataFile.print(",");
-    dataFile.print("Pweak0000");
-    dataFile.print("=");
-    dataFile.print(P_weak);
-    dataFile.print(",");
-    dataFile.print("Iweak0000");
-    dataFile.print("=");
-    dataFile.print(I_weak);
-    dataFile.print(",");
-    dataFile.print("Dweak0000");
-    dataFile.print("=");
-    dataFile.print(D_weak);
-    dataFile.print(",");
-    dataFile.print("LEDPIN000");
-    dataFile.print("=");
-    dataFile.print(ledPin);
-    dataFile.print(",");
-    dataFile.print("GATE00000");
-    dataFile.print("=");
-    dataFile.print(GATE);
-    dataFile.print(",");
-    dataFile.print("PULSE0000");
-    dataFile.print("=");
-    dataFile.print(PULSE);
-    dataFile.print(",");
-    dataFile.print("HALFWAVE0");
-    dataFile.print("=");
-    dataFile.print(HALF_WAVE);
-    dataFile.print(",");
-    #if (defined(BIPPEUR))
-        dataFile.print("BEEPPIN00");
-        dataFile.print("=");
-        dataFile.print(Beep_PIN);
-        dataFile.print(",");
-    #endif
-    dataFile.print("PIDOFFSET");
-    dataFile.print("=");
-    dataFile.print(PID_OFFSET);
-    dataFile.print(",");
-    #if defined(DS18B20)
-      dataFile.print("ONEWIRE00");
-      dataFile.print("=");
-      dataFile.print(ONE_WIRE_BUS);
-      dataFile.print(",");
-    #endif
-
-    dataFile.close();
+  // Serialize JSON to file
+  if (serializeJson(doc, file) == 0) {
+    Serial.println(F("Failed to write to file"));
   }
-  digitalWrite(ledPin, 0);
+
+  // Close the file
+  file.close();
+}
+
+// Prints the content of a file to the Serial
+void printFile(const char *filename) {
+  // Open file for reading
+  File file = SD.open(filename);
+  if (!file) {
+    Serial.println(F("Failed to read file"));
+    return;
+  }
+
+  // Extract each characters by one by one
+  while (file.available()) {
+    Serial.print((char)file.read());
+  }
+  Serial.println();
+
+  // Close the file
+  file.close();
 }
