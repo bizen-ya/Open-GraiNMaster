@@ -32,7 +32,7 @@
 #include "SdFat.h"
 #include <ArduinoJson.h>
 #include <PID_v1.h> //gestion de l'algo PID
-#include <avr/pgmspace.h>
+//#include <avr/pgmspace.h>
 #include "Timer.h" // gestion des timers
 #include <jm_LCM2004A_I2C.h> //gestion du LCD
 #include <avr/io.h>
@@ -43,10 +43,14 @@
 #include <Wire.h>
 #include "RTClib.h"
 RTC_DS1307 rtc;
-char daysOfTheWeek[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
-char RtcTime[9];
-char RtcDate[11];
+
+char RtcTime[9] = "xxhxxmxx";
+char RtcDate[11] = "xx/xx/xxxx";
 DateTime now;
+
+
+
+
 
 // Json config
 struct Config {
@@ -107,6 +111,11 @@ double Kd = config.D_strong; //coef de dérivée
 
 #define DEBUG           // Décommenter pour afficher les informations de deboguage (PID sur le LCD)
 #define MAX31865
+#define MAX31865_2
+
+float temp1;
+float temp2;
+
 
 #define DEFIL           // Commenter pour ne pas faire alterner le texte sur la deuxième ligne pour afficher le temps restant total avant la fin de l'ébullition
 #define PIDDEBUG        // Commenter pour enlever l'information du PID sur l'écran lors de la chauffe
@@ -118,7 +127,13 @@ double Kd = config.D_strong; //coef de dérivée
 #endif
 
 #ifdef DEBUG
-#define DEBUGPRINTLN(x) Serial.println(String(RtcDate) + " " + String(RtcTime) + " : " + x)
+
+void printdebug(String str)
+{
+  Serial.println(String(RtcDate) + " " + String(RtcTime) + " : " + str);
+}
+
+#define DEBUGPRINTLN(x) printdebug(x)
 #else
 #define DEBUGPRINTLN(x)
 #endif
@@ -137,9 +152,14 @@ int HALF_WAVE = 560;// //nombre de "tics" d'horloge à chaque demi onde 50Hz . 6
 #include <Adafruit_MAX31865.h>
 
 // Use software SPI: CS, DI, DO, CLK
-Adafruit_MAX31865 thermo = Adafruit_MAX31865(42, 40, 38, 36);
+Adafruit_MAX31865 thermo = Adafruit_MAX31865(42, 43, 44, 45);
+
+#if defined(MAX31865_2)
+Adafruit_MAX31865 thermo2 = Adafruit_MAX31865(38, 39, 40, 41);
+#endif
+
 // use hardware SPI, just pass in the CS pin
-//Adafruit_MAX31865 thermo = Adafruit_MAX31865(10);
+// Adafruit_MAX31865 thermo = Adafruit_MAX31865(42);
 
 // The value of the Rref resistor. Use 430.0 for PT100 and 4300.0 for PT1000
 #define RREF      430.0
@@ -189,8 +209,6 @@ bool palier_atteint = false;
 int logRecord_ID;   // Timer ID pour la fonction logRecord, pour un arrêt propre du programme (on veut le stopper avant d'arrêter le programme pour éviter toute écriture quand on ddébranche l'Arduino)
 
 unsigned int cooling = 0; // compteur du temps de refroidissement
-
-float last_temp = 0; // dernière température positive
 
 //int therm; //variable pour le relevé de température
 
@@ -247,16 +265,100 @@ FsFile myFile;
 #error Invalid SD_FAT_TYPE
 #endif  // SD_FAT_TYPE
 
-String datalogFile; // Fichier de log, à chaque brassage différent
+char datalogFile[40]; // Fichier de log, à chaque brassage différent
 
 char degre = (char)176;  // char 176 = ° (signe degré) en unicode
 
+void setTime()
+{
+
+  int setrtc[] = { now.day(), now.month(), now.year(), now.hour(), now.minute(), now.second()};
+  char item_ind[6][21] = {
+    "^^                 ",
+    "   ^^              ",
+    "      ^^^^         ",
+    "           ^^      ",
+    "              ^^   ",
+    "                 ^^"
+  };
+  int item = 0;
+  char str[20];
+
+  CLS();
+
+  lcd_key = btnNONE;
+  delay(1500);
+
+  while ( lcd_key != btnSELECT )
+  {
+
+    CLS();           // move to position 0 on the first line
+    lcd.print("Reglage date / heure");
+    lcd.setCursor(0, 1);           // move to position 0 on the second line
+    sprintf(str, "%02d-%02d-%04d %02dh%02dm%02d", setrtc[0], setrtc[1], setrtc[2], setrtc[3], setrtc[4], setrtc[5]);
+    lcd.print(str);
+    lcd.setCursor(0, 2);           // move to position 0 on the second line
+    lcd.print(item_ind[item] );
+    lcd.setCursor(0, 3);           // move to position 0 on the second line
+    lcd.print("<< >> ok>Select");
+
+    while ( lcd_key == btnNONE )
+    {
+      delay(200);
+      lcd_key = read_LCD_buttons();  // read the buttons
+    }
+
+    switch (lcd_key)
+    {
+      case btnNONE:
+        {
+          break;
+        }
+
+      case btnLEFT:
+        {
+          item = item - 1;
+          break;
+        }
+
+      case btnRIGHT:
+        {
+          item = item + 1;
+          break;
+        }
+
+      case btnDOWN:
+        {
+          DEBUGPRINTLN ("Down !");
+          setrtc[item] = setrtc[item] - 1;
+          break;
+        }
+
+      case btnUP:
+        {
+          DEBUGPRINTLN ("Up !");
+          setrtc[item] = setrtc[item] + 1;
+          break;
+        }
+
+      case btnSELECT:
+        {
+          DEBUGPRINTLN ("Change Time !");
+          rtc.adjust(DateTime(setrtc[2], setrtc[1], setrtc[0], setrtc[3], setrtc[4], setrtc[5]));
+          return;
+        }
+    }
+
+    lcd_key = btnNONE;
+
+  }
+}
 
 void setup()
 {
 #if defined(DEBUG)
   Serial.begin(9600);
-  DEBUGPRINTLN  ("Startup ok\n");
+  DEBUGPRINTLN  ("Startup ok");
 #endif
 
   // setup buttons
@@ -289,14 +391,14 @@ void setup()
     now = rtc.now();
 
     sprintf(RtcTime, "%02dh%02dm%02d", now.hour(), now.minute(), now.second());
-    sprintf(RtcDate, "%02d-%02d-%02d", now.day(), now.month(), now.year());
+    sprintf(RtcDate, "%02d-%02d-%04d", now.day(), now.month(), now.year());
 
-    DEBUGPRINTLN("Time : " + String(RtcDate) + " " + String(RtcTime) );
+    DEBUGPRINTLN("Time" );
 
     CLS();           // move to position 0 on the first line
     lcd.print("Date Heure OK ?");
     lcd.setCursor(0, 1);           // move to position 0 on the second line
-    lcd.print(String(RtcDate) + " " + String(RtcTime));
+    lcd.print(String(RtcDate) + " " + String( RtcTime));
     lcd.setCursor(0, 3);           // move to position 0 on the second line
     lcd.print("Select pour Changer!");
     while ( lcd_key == btnNONE)
@@ -316,17 +418,16 @@ void setup()
         {
           DEBUGPRINTLN ("Change Time !");
 
-
           rtc.adjust(DateTime(0, 0, 0, 0, 0, 0));
-
           rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
 
+          setTime();
+
+          now = rtc.now();
 
           sprintf(RtcTime, "%02dh%02dm%02d", now.hour(), now.minute(), now.second());
-          sprintf(RtcDate, "%02d-%02d-%02d", now.day(), now.month(), now.year());
-
-          // rtc.adjust(DateTime(year, month, monthday, hour, minute, second));
-
+          sprintf(RtcDate, "%02d-%02d-%04d", now.day(), now.month(), now.year());
+          break;
         }
 
     }
@@ -340,7 +441,10 @@ void setup()
   thermo.begin(MAX31865_3WIRE);  // set to 3WIRE or 4WIRE as necessary
 #endif
 
-
+#if defined(MAX31865_2)
+  DEBUGPRINTLN("Adafruit MAX31865 PT100 Sonde 2");
+  thermo2.begin(MAX31865_3WIRE);  // set to 3WIRE or 4WIRE as necessary
+#endif
   //pinMode(53, OUTPUT); //la pin 53 est normalement attribuée à la fonction SPI Slave Select (SS)Permet d'activer ou désactiver le périphérique
   // Suivant les modules SD, il peut être nécessaire de commenter cette ligne (c'est le cas de mon module même si c'est pas logique)
 
@@ -370,7 +474,7 @@ void setup()
   lcd.createChar(1, beer2);
   CLS();           // fonction qui efface le LCD et met le curseur au début
   lcd.print(" - GraiN.Master - ");
-  DEBUGPRINTLN  ("Print ok\n");
+  DEBUGPRINTLN  ("Print ok");
   lcd.setCursor(0, 1);
   lcd.write(byte(0));
   lcd.write(byte(1));
@@ -412,35 +516,37 @@ void setup()
   }
 
   CLS();           // move cursor to beginning of line "0"
-  lcd.print(" Lecture  param "); // print a simple message
+  lcd.print(" Lecture param "); // print a simple message
 
   if ( sd.exists(filename)) {
 
     // Should load default config if run for the first time
-    Serial.println(F("Loading configuration..."));
+    DEBUGPRINTLN("Loading configuration...");
     loadConfiguration(filename, config);
+    DEBUGPRINTLN("Loaded...");
   }
   else
   {
 
     // Create configuration file
-    Serial.println(F("Saving configuration..."));
+    DEBUGPRINTLN("Saving configuration...");
     saveConfiguration(filename, config);
+    DEBUGPRINTLN("Saved...");
 
   }
 
   // Dump config file
-  DEBUGPRINTLN(F("Print config file..."));
+  DEBUGPRINTLN("Print config file...");
   printFile(filename);
-  DEBUGPRINTLN(F("End Print config file..."));
+  DEBUGPRINTLN("End Print config file...");
 
-  datalogFile = "log_" + String(RtcDate) + "_" + String(RtcTime) + ".txt"; // Le nom du fichier, avec un numéro pseudo-aléatoire pour éviter de réécrire sur le même à chaque brassin
-  DEBUGPRINTLN("Datalogfile = " + datalogFile);
+  sprintf(datalogFile, "log_%s_%s.txt", RtcDate, RtcTime); // Le nom du fichier, avec un numéro pseudo-aléatoire pour éviter de réécrire sur le même à chaque brassin
+  DEBUGPRINTLN(strcat("Datalogfile = " , datalogFile));
 
   digitalWrite(config.ledPin, 1);
   myFile = sd.open(datalogFile, O_WRITE | O_CREAT | O_AT_END);
   if (myFile) {
-    DEBUGPRINTLN("Writing info to Datalogfile = " + datalogFile);
+    DEBUGPRINTLN(strcat("Writing info to Datalogfile = " , datalogFile));
     myFile.print("Temps (secondes)");
     myFile.print("; ");
     myFile.print("Palier en cours");
@@ -455,7 +561,7 @@ void setup()
   }
   else
   {
-    DEBUGPRINTLN("Error Writing info to Datalogfile = " + datalogFile);
+    DEBUGPRINTLN(strcat("Error Writing info to Datalogfile = ", datalogFile));
   }
 
   digitalWrite(config.ledPin, 0);
@@ -546,7 +652,7 @@ void display_palier(int numpalier, String *line1, String *line2) {
   for (int i = 1; i <= numpalier; i++) {
     t += config.myTempo[i];
   }
-  DEBUGPRINTLN("t : " + String(t) + " / minutes : " + String(minutes));
+  DEBUGPRINTLN(strcat(strcat("t : ", t), strcat( " / minutes : ", minutes)));
   // Si le temps n'est pas dépassé (t = temps total qu'il faut atteindre depuis le premier palier jusqu'à celui en cours)
   if (t > minutes) {
     config.myTempo[0] = t - minutes;
@@ -705,6 +811,8 @@ void LCD_upd() // affiche les infos à l'écran ********************************
   lcd.print(Char1);
   lcd.setCursor(0, 1);
   lcd.print(Char2);
+  lcd.setCursor(0, 2);
+  lcd.print("T1 : " + String(temp1) + " T2: " + String(temp2));
   lcd.setCursor(0, 3);
   lcd.print(String(RtcDate) + " " + String(RtcTime));
 
@@ -731,20 +839,23 @@ int read_LCD_buttons() //cette fonction renvoie la touche appuyée
 
 float gettemp()
 {
-  myPID.Compute(); //on Lance un calcul du PID. le calcul se fait en même temps que le rafraichissement des variables de température
-
   float ttt;
 
 #if defined(MAX31865)
-  uint16_t rtd = thermo.readRTD();
+  //uint16_t rtd = thermo.readRTD();
 
-  float ratio = rtd;
-  ratio /= 32768;
+  //Serial.print("RTD value: "); Serial.println(rtd);
+  //float ratio = rtd;
+  //ratio /= 32768;
+  //Serial.print("Ratio = "); Serial.println(ratio, 8);
+  //Serial.print("Resistance = "); Serial.println(RREF * ratio, 8);
+  //Serial.print("Temperature = "); Serial.println(thermo.temperature(RNOMINAL, RREF));
 
   // Check and print any faults
   uint8_t fault = thermo.readFault();
+  //Serial.print("Fault 0x"); Serial.println(fault, HEX);
   if (fault) {
-    Serial.print("Fault 0x"); Serial.println(fault, HEX);
+
     if (fault & MAX31865_FAULT_HIGHTHRESH) {
       DEBUGPRINTLN("RTD High Threshold");
     }
@@ -765,12 +876,57 @@ float gettemp()
     }
     thermo.clearFault();
   }
-
-  ttt = thermo.temperature(RNOMINAL, RREF);
-
+  else
+  {
+    temp1 = thermo.temperature(RNOMINAL, RREF);
+    ttt = temp1;
+  }
 #endif
 
-  last_temp = ttt;
+#if defined(MAX31865_2)
+  //uint16_t rtd = thermo.readRTD();
+
+  //Serial.print("RTD value: "); Serial.println(rtd);
+  //float ratio = rtd;
+  //ratio /= 32768;
+  //Serial.print("Ratio = "); Serial.println(ratio, 8);
+  //Serial.print("Resistance = "); Serial.println(RREF * ratio, 8);
+  //Serial.print("Temperature = "); Serial.println(thermo.temperature(RNOMINAL, RREF));
+
+  // Check and print any faults
+  uint8_t fault2 = thermo2.readFault();
+  //Serial.print("Fault 0x"); Serial.println(fault, HEX);
+  if (fault2) {
+
+    if (fault2 & MAX31865_FAULT_HIGHTHRESH) {
+      DEBUGPRINTLN("RTD High Threshold");
+    }
+    if (fault2 & MAX31865_FAULT_LOWTHRESH) {
+      DEBUGPRINTLN("RTD Low Threshold");
+    }
+    if (fault2 & MAX31865_FAULT_REFINLOW) {
+      DEBUGPRINTLN("REFIN - > 0.85 x Bias");
+    }
+    if (fault2 & MAX31865_FAULT_REFINHIGH) {
+      DEBUGPRINTLN("REFIN - < 0.85 x Bias - FORCE - open");
+    }
+    if (fault2 & MAX31865_FAULT_RTDINLOW) {
+      DEBUGPRINTLN("RTDIN - < 0.85 x Bias - FORCE - open");
+    }
+    if (fault2 & MAX31865_FAULT_OVUV) {
+      DEBUGPRINTLN("Under / Over voltage");
+    }
+    thermo2.clearFault();
+  }
+  else
+  {
+    temp2 = thermo2.temperature(RNOMINAL, RREF);
+    ttt = ( temp1 + temp2 ) / 2 ;
+  }
+#endif
+
+  myPID.Compute(); //on Lance un calcul du PID. le calcul se fait en même temps que le rafraichissement des variables de température
+
   return ttt;
 }
 
@@ -786,7 +942,7 @@ void horloge() //fonction appelée une fois par seconde . On profite de cette fo
   now = rtc.now();
 
   sprintf(RtcTime, "%02dh%02dm%02d", now.hour(), now.minute(), now.second());
-  sprintf(RtcDate, "%02d-%02d-%02d", now.day(), now.month(), now.year());
+  sprintf(RtcDate, "%02d-%02d-%04d", now.day(), now.month(), now.year());
 
   secondes_reel++;
 
@@ -809,7 +965,7 @@ void horloge() //fonction appelée une fois par seconde . On profite de cette fo
     // Si le menu correpsond à un palier en cours (sauf préchauffage), on incrémente les minutes
     if (menu >= 9) {
       minutes++;
-      DEBUGPRINTLN("Minutes écoulées : : " + String(minutes));
+      DEBUGPRINTLN(strcat("Minutes écoulées : : " , minutes));
     }
   }
 
@@ -1223,7 +1379,7 @@ void sel_menu()
                 saveConfiguration(filename, config);
 
                 myFile = sd.open(datalogFile, O_WRITE | O_CREAT | O_AT_END);
-                DEBUGPRINTLN("Write on " + datalogFile);
+                DEBUGPRINTLN(strcat("Write on " , datalogFile));
                 if (myFile) {
                   myFile.print("----GraiN.Master----\n");
                   myFile.print(version);
@@ -1246,14 +1402,13 @@ void sel_menu()
                 }
                 else
                 {
-                  DEBUGPRINTLN("Error Writing info to Datalogfile = " + datalogFile);
+                  DEBUGPRINTLN(strcat("Error Writing info to Datalogfile = " , datalogFile));
                 }
 
                 DEBUGPRINTLN("----GraiN.Master----");
                 DEBUGPRINTLN(version);
-                DEBUGPRINTLN("\nTempérature de départ : ");
-                DEBUGPRINTLN(config.myTemperatures[0]);
-                DEBUGPRINTLN("°C\n");
+                DEBUGPRINTLN("Température de départ : " + String(config.myTemperatures[0]) + "°C"  );
+
 #ifdef DEBUG
                 for (int i = 1; i < 7; i++) {
                   DEBUGPRINTLN(config.myPaliers[0][i]);
@@ -1428,7 +1583,7 @@ void logRecord()
   }
   else
   {
-    DEBUGPRINTLN("Error Writing info to Datalogfile = " + datalogFile);
+    DEBUGPRINTLN(strcat("Error Writing info to Datalogfile = ", datalogFile));
   }
 
   digitalWrite(config.ledPin, 0);
@@ -1475,7 +1630,7 @@ void loadConfiguration(const char *filename, Config &config) {
   config.ledPin = doc["ledPin"];
 
   // Close the file (Curiously, File's destructor doesn't close the file)
-  myFile.close();
+  //myFile.close();
 }
 
 // Saves the configuration to a file
@@ -1486,7 +1641,7 @@ void saveConfiguration(const char *filename, const Config &config) {
   // Open file for writing
   File myFile = sd.open(filename, O_WRITE | O_CREAT | O_AT_END);
   if (!myFile) {
-    Serial.println(F("Failed to create file"));
+    Serial.println("Failed to create file");
     return;
   }
 
@@ -1494,7 +1649,7 @@ void saveConfiguration(const char *filename, const Config &config) {
   // Don't forget to change the capacity to match your requirements.
   // Use arduinojson.org/assistant to compute the capacity.
   StaticJsonDocument<4096> doc;
-
+  Serial.println("Allocated");
   // Set the values in the document
   doc["hysteresis_Pos"] = config.hysteresis_Pos;
   doc["hysteresis_Neg"] = config.hysteresis_Neg;
@@ -1511,13 +1666,17 @@ void saveConfiguration(const char *filename, const Config &config) {
   doc["Beep_PIN"] = config.Beep_PIN;
   doc["ledPin"] = config.ledPin;
 
+Serial.println("Assigned");
+
   // Serialize JSON to file
   if (serializeJson(doc, myFile) == 0) {
-    Serial.println(F("Failed to write to file"));
+    Serial.println("Failed to write to file");
   }
 
   // Close the file
-  myFile.close();
+  Serial.println("Close file");
+  //myFile.close();
+  Serial.println("Closed file");
 }
 
 // Prints the content of a file to the Serial
@@ -1525,7 +1684,7 @@ void printFile(const char *filename) {
   // Open file for reading
   myFile = sd.open(filename);
   if (!myFile) {
-    Serial.println(F("Failed to read file"));
+    Serial.println("Failed to read file");
     return;
   }
 
