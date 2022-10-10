@@ -32,7 +32,7 @@
 #include "SdFat.h"
 #include <ArduinoJson.h>
 #include <PID_v1.h> //gestion de l'algo PID
-//#include <avr/pgmspace.h>
+#include <avr/pgmspace.h>
 #include "Timer.h" // gestion des timers
 #include <jm_LCM2004A_I2C.h> //gestion du LCD
 #include <avr/io.h>
@@ -47,10 +47,6 @@ RTC_DS1307 rtc;
 char RtcTime[9] = "xxhxxmxx";
 char RtcDate[11] = "xx/xx/xxxx";
 DateTime now;
-
-
-
-
 
 // Json config
 struct Config {
@@ -105,6 +101,7 @@ struct Config {
 const char *filename = "/config.txt";  // <- SD library uses 8.3 filenames
 Config config;                         // <- global configuration object
 
+
 double Kp = config.P_strong; // multiplicateur de l'erreur différentielle de température.
 double Ki = config.I_strong; //coef de correction inverse
 double Kd = config.D_strong; //coef de dérivée
@@ -127,13 +124,7 @@ float temp2;
 #endif
 
 #ifdef DEBUG
-
-void printdebug(String str)
-{
-  Serial.println(String(RtcDate) + " " + String(RtcTime) + " : " + str);
-}
-
-#define DEBUGPRINTLN(x) printdebug(x)
+#define DEBUGPRINTLN(x) Serial.println(x);
 #else
 #define DEBUGPRINTLN(x)
 #endif
@@ -251,25 +242,21 @@ const uint8_t chipSelect = SS;
 //------------------------------------------------------------------------------
 #if SD_FAT_TYPE == 0
 SdFat sd;
-File configFile;
-File logFile;
+File myFile;
 #elif SD_FAT_TYPE == 1
 SdFat32 sd;
-File32 configFile;
-File32 logFile;
+File32 myFile;
 #elif SD_FAT_TYPE == 2
 SdExFat sd;
-ExFile configFile;
-ExFile logFile;
+ExFile myFile;
 #elif SD_FAT_TYPE == 3
 SdFs sd;
-FsFile configFile;
-FsFile logFile;
+FsFile myFile;
 #else  // SD_FAT_TYPE
 #error Invalid SD_FAT_TYPE
 #endif  // SD_FAT_TYPE
 
-char datalogFile[40]; // Fichier de log, à chaque brassage différent
+String datalogFile; // Fichier de log, à chaque brassage différent
 
 char degre = (char)176;  // char 176 = ° (signe degré) en unicode
 
@@ -286,7 +273,7 @@ void setTime()
     "                 ^^"
   };
   int item = 0;
-  char str[20];
+  char str[21];
 
   CLS();
 
@@ -365,6 +352,8 @@ void setup()
   DEBUGPRINTLN  ("Startup ok");
 #endif
 
+  DEBUGPRINTLN("Config : " + String(config.hysteresis_Pos));
+  
   // setup buttons
   pinMode(btnUP, INPUT_PULLUP);
   pinMode(btnDOWN, INPUT_PULLUP);
@@ -453,7 +442,6 @@ void setup()
   // Suivant les modules SD, il peut être nécessaire de commenter cette ligne (c'est le cas de mon module même si c'est pas logique)
 
 
-
   // création des caractères spéciaux
   byte beer1[8] = {
     B10001,
@@ -509,7 +497,6 @@ void setup()
   // pinMode(10, OUTPUT);
 
 
-
   CLS();          // move cursor to beginning of line "0"
   lcd.print("initialise  SD  "); // print a simple message
   delay(600);
@@ -521,7 +508,7 @@ void setup()
 
   CLS();           // move cursor to beginning of line "0"
   lcd.print(" Lecture param "); // print a simple message
-
+  sd.remove(filename);
   if ( sd.exists(filename)) {
 
     // Should load default config if run for the first time
@@ -544,28 +531,28 @@ void setup()
   printFile(filename);
   DEBUGPRINTLN("End Print config file...");
 
-  sprintf(datalogFile, "log_%s_%s.txt", RtcDate, RtcTime); // Le nom du fichier, avec un numéro pseudo-aléatoire pour éviter de réécrire sur le même à chaque brassin
-  DEBUGPRINTLN(strcat("Datalogfile = " , datalogFile));
+  datalogFile = "log_" + String(RtcDate) + "_" + String(RtcTime) + ".txt"; // Le nom du fichier, avec un numéro pseudo-aléatoire pour éviter de réécrire sur le même à chaque brassin
+  DEBUGPRINTLN("Datalogfile = " + datalogFile);
 
   digitalWrite(config.ledPin, 1);
-  logFile = sd.open(datalogFile, O_WRITE | O_CREAT | O_AT_END);
-  if (logFile) {
-    DEBUGPRINTLN(strcat("Writing info to Datalogfile = " , datalogFile));
-    logFile.print("Temps (secondes)");
-    logFile.print("; ");
-    logFile.print("Palier en cours");
-    logFile.print("; ");
-    logFile.print("Objectif de temperature (°C)");
-    logFile.print("; ");
-    logFile.print("Temperature mesuree (°C)");
-    logFile.print("; ");
-    logFile.print("PID - taux de chauffe (0 - 255)");
-    logFile.print('\n');
-    logFile.close();
+  myFile = sd.open(datalogFile, O_WRITE | O_CREAT | O_AT_END);
+  if (myFile) {
+    DEBUGPRINTLN("Writing info to Datalogfile = " + datalogFile);
+    myFile.print("Temps (secondes)");
+    myFile.print("; ");
+    myFile.print("Palier en cours");
+    myFile.print("; ");
+    myFile.print("Objectif de temperature (°C)");
+    myFile.print("; ");
+    myFile.print("Temperature mesuree (°C)");
+    myFile.print("; ");
+    myFile.print("PID - taux de chauffe (0 - 255)");
+    myFile.print('\n');
+    myFile.close();
   }
   else
   {
-    DEBUGPRINTLN(strcat("Error Writing info to Datalogfile = ", datalogFile));
+    DEBUGPRINTLN("Error Writing info to Datalogfile = " + datalogFile);
   }
 
   digitalWrite(config.ledPin, 0);
@@ -656,7 +643,7 @@ void display_palier(int numpalier, String *line1, String *line2) {
   for (int i = 1; i <= numpalier; i++) {
     t += config.myTempo[i];
   }
-  DEBUGPRINTLN(strcat(strcat("t : ", t), strcat( " / minutes : ", minutes)));
+  DEBUGPRINTLN("t : " + String(t)+ " / minutes : " + String(minutes));
   // Si le temps n'est pas dépassé (t = temps total qu'il faut atteindre depuis le premier palier jusqu'à celui en cours)
   if (t > minutes) {
     config.myTempo[0] = t - minutes;
@@ -969,7 +956,7 @@ void horloge() //fonction appelée une fois par seconde . On profite de cette fo
     // Si le menu correpsond à un palier en cours (sauf préchauffage), on incrémente les minutes
     if (menu >= 9) {
       minutes++;
-      DEBUGPRINTLN(strcat("Minutes écoulées : : " , minutes));
+      DEBUGPRINTLN("Minutes écoulées : : " + String(minutes));
     }
   }
 
@@ -1382,31 +1369,31 @@ void sel_menu()
 
                 saveConfiguration(filename, config);
 
-                logFile = sd.open(datalogFile, O_WRITE | O_CREAT | O_AT_END);
-                DEBUGPRINTLN(strcat("Write on " , datalogFile));
-                if (logFile) {
-                  logFile.print("----GraiN.Master----\n");
-                  logFile.print(version);
-                  logFile.println("\nDate / Heure : " + String(RtcDate) + " " + String(RtcTime));
-                  logFile.print("\nTempérature de départ : ");
-                  logFile.print(config.myTemperatures[0]);
-                  logFile.print("°C\n");
+                myFile = sd.open(datalogFile, O_WRITE | O_CREAT | O_AT_END);
+                DEBUGPRINTLN("Write on " + datalogFile);
+                if (myFile) {
+                  myFile.print("----GraiN.Master----\n");
+                  myFile.print(version);
+                  myFile.println("\nDate / Heure : " + String(RtcDate) + " " + String(RtcTime));
+                  myFile.print("\nTempérature de départ : ");
+                  myFile.print(config.myTemperatures[0]);
+                  myFile.print("°C\n");
 
                   for (int i = 1; i < 7; i++) {
-                    logFile.print(config.myPaliers[0][i]);
-                    logFile.print(config.myTempo[i]);
-                    logFile.print(" min - ");
-                    logFile.print(config.myTemperatures[i]);
-                    logFile.print("°C\n");
+                    myFile.print(config.myPaliers[0][i]);
+                    myFile.print(config.myTempo[i]);
+                    myFile.print(" min - ");
+                    myFile.print(config.myTemperatures[i]);
+                    myFile.print("°C\n");
                   }
 
-                  logFile.print("\n\n");
-                  logFile.print("Temps (s), Température cible °C, Température °C, PID (0 - 255)\n");
-                  logFile.close();
+                  myFile.print("\n\n");
+                  myFile.print("Temps (s), Température cible °C, Température °C, PID (0 - 255)\n");
+                  myFile.close();
                 }
                 else
                 {
-                  DEBUGPRINTLN(strcat("Error Writing info to Datalogfile = " , datalogFile));
+                  DEBUGPRINTLN("Error Writing info to Datalogfile = " + datalogFile);
                 }
 
                 DEBUGPRINTLN("----GraiN.Master----");
@@ -1568,26 +1555,26 @@ void logRecord()
     numpalier = 0;
   else numpalier = menu - 8;
   digitalWrite(config.ledPin, 1);
-  logFile = sd.open(datalogFile, O_WRITE | O_CREAT | O_AT_END);
-  if (logFile) {
-    logFile.println("\nDate / Heure : " + String(RtcDate) + " " + String(RtcTime));
-    logFile.print(secondes_reel);
-    logFile.print("; ");
+  myFile = sd.open(datalogFile, O_WRITE | O_CREAT | O_AT_END);
+  if (myFile) {
+    myFile.println("\nDate / Heure : " + String(RtcDate) + " " + String(RtcTime));
+    myFile.print(secondes_reel);
+    myFile.print("; ");
     if (numpalier != 7)
-      logFile.print(config.myPaliers[0][numpalier]);
-    else logFile.print("Refroidissement");
-    logFile.print("; ");
-    logFile.print(theta_objectif);
-    logFile.print("; ");
-    logFile.print(theta_mesure);
-    logFile.print("; ");
-    logFile.print(tx_chauffe);
-    logFile.print('\n');
-    logFile.close();
+      myFile.print(config.myPaliers[0][numpalier]);
+    else myFile.print("Refroidissement");
+    myFile.print("; ");
+    myFile.print(theta_objectif);
+    myFile.print("; ");
+    myFile.print(theta_mesure);
+    myFile.print("; ");
+    myFile.print(tx_chauffe);
+    myFile.print('\n');
+    myFile.close();
   }
   else
   {
-    DEBUGPRINTLN(strcat("Error Writing info to Datalogfile = ", datalogFile));
+    DEBUGPRINTLN("Error Writing info to Datalogfile = " + datalogFile);
   }
 
   digitalWrite(config.ledPin, 0);
@@ -1605,7 +1592,7 @@ void logRecord()
 // Loads the configuration from a file
 void loadConfiguration(const char *filename, Config &config) {
   // Open file for reading
-  configFile = sd.open(filename);
+  myFile = sd.open(filename);
 
   // Allocate a temporary JsonDocument
   // Don't forget to change the capacity to match your requirements.
@@ -1613,7 +1600,7 @@ void loadConfiguration(const char *filename, Config &config) {
   StaticJsonDocument<4096> doc;
 
   // Deserialize the JSON document
-  DeserializationError error = deserializeJson(doc, configFile);
+  DeserializationError error = deserializeJson(doc, myFile);
   if (error)
     Serial.println(F("Failed to read file, using default configuration"));
 
@@ -1634,17 +1621,18 @@ void loadConfiguration(const char *filename, Config &config) {
   config.ledPin = doc["ledPin"];
 
   // Close the file (Curiously, File's destructor doesn't close the file)
-  configFile.close();
+  myFile.close();
 }
 
 // Saves the configuration to a file
 void saveConfiguration(const char *filename, const Config &config) {
   // Delete existing file, otherwise the configuration is appended to the file
+
   sd.remove(filename);
 
   // Open file for writing
-  File configFile = sd.open(filename, O_WRITE | O_CREAT | O_AT_END);
-  if (!configFile) {
+  myFile = sd.open(filename, O_WRITE | O_CREAT );
+  if (!myFile) {
     Serial.println("Failed to create file");
     return;
   }
@@ -1673,31 +1661,33 @@ void saveConfiguration(const char *filename, const Config &config) {
 Serial.println("Assigned");
 
   // Serialize JSON to file
-  if (serializeJson(doc, configFile) == 0) {
+  if (serializeJson(doc, myFile) == 0) {
     Serial.println("Failed to write to file");
   }
 
   // Close the file
   Serial.println("Close file");
-  configFile.close();
+
+  myFile.close();
   Serial.println("Closed file");
+
 }
 
 // Prints the content of a file to the Serial
 void printFile(const char *filename) {
   // Open file for reading
-  configFile = sd.open(filename);
-  if (!configFile) {
+  myFile = sd.open(filename, O_READ);
+  if (!myFile) {
     Serial.println("Failed to read file");
     return;
   }
 
   // Extract each characters by one by one
-  while (configFile.available()) {
-    Serial.print((char)configFile.read());
+  while (myFile.available()) {
+    Serial.print((char)myFile.read());
   }
   Serial.println();
 
   // Close the file
-  configFile.close();
+  myFile.close();
 }
