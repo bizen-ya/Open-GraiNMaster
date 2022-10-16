@@ -5,7 +5,7 @@
   Testé et compilé sur Arduino IDE v1.6.8
 *******************************************************/
 
-#define version  " --V1.005-- "
+#define version " --V1.005-- "
 
 /*
   v1.000 le 14/05/2016
@@ -31,32 +31,32 @@
 #include <SPI.h>
 #include "SdFat.h"
 #include <ArduinoJson.h>
-#include <PID_v1.h> //gestion de l'algo PID
+#include <PID_v1.h>  //gestion de l'algo PID
 #include <avr/pgmspace.h>
-#include "Timer.h" // gestion des timers
-#include <jm_LCM2004A_I2C.h> //gestion du LCD
+#include "Timer.h"            // gestion des timers
+#include <jm_LCM2004A_I2C.h>  //gestion du LCD
 #include <avr/io.h>
-#include <avr/interrupt.h> //gestion des interruptions
+#include <avr/interrupt.h>  //gestion des interruptions
 #include <Wire.h>
 
 // Date and time functions using a DS1307 RTC connected via I2C and Wire lib
-#include <Wire.h>
 #include "RTClib.h"
+#include <TimeLib.h>
 RTC_DS1307 rtc;
 
-char RtcTime[9] = "xxhxxmxx";
-char RtcDate[11] = "xx/xx/xxxx";
-DateTime now;
+char RtcTime[20] = "xxhxxmxx";
+char RtcDate[20] = "xx-xx-xxxx";
+
 
 // Json config
 struct Config {
   //valeurs de l'hysteresis pour passage en PID fin ou grossier
-  byte hysteresis_Pos =  1;
-  byte hysteresis_Neg  = 1;
+  byte hysteresis_Pos = 1;
+  byte hysteresis_Neg = 1;
 
   String myPaliers[2][7] = {
-    {"Prechauffe", "Palier 1  ", "Palier 2  ", "Palier 3  ", "Palier 4  ", "Mash-out  ", "Ebullition"},   // Nom des paliers en version longue (10 caractères)
-    {"PREC",         "PAL1",     "PAL2",     "PAL3",     "PAL4",     "MOUT",     "EBUL"      }    // Nom des paliers en version courte (4 caractères)
+    { "Prechauffe", "Palier 1  ", "Palier 2  ", "Palier 3  ", "Palier 4  ", "Mash-out  ", "Ebullition" },  // Nom des paliers en version longue (10 caractères)
+    { "PREC", "PAL1", "PAL2", "PAL3", "PAL4", "MOUT", "EBUL" }                                             // Nom des paliers en version courte (4 caractères)
   };
 
   float myTemperatures[7] = {
@@ -67,17 +67,17 @@ struct Config {
     68.75,  // = theta4, température de sacharification A amylase
     75.75,  // = thetaMO, température de mash out
     103.0   // = theta5, température d'ébullition
-  }; // Températures pour chaque myPaliers
+  };        // Températures pour chaque myPaliers
 
   byte myTempo[7] {
-    0,      // tempo_A, pour l'affichage temporaire
-    0,      // tempo1, palier empâtage céréales non maltées
-    15,     // tempo2, palier protéinique
-    35,     // tempo3, palier de sacharification B amylase
-    30,     // tempo4, palier de sacharification A amylase
-    5,      // palier de Mash Out
-    70      // tempo5, ébullition
-  }; // Temporisation pour chaque myPaliers
+    0,   // tempo_A, pour l'affichage temporaire
+    0,   // tempo1, palier empâtage céréales non maltées
+    15,  // tempo2, palier protéinique
+    35,  // tempo3, palier de sacharification B amylase
+    30,  // tempo4, palier de sacharification A amylase
+    5,   // palier de Mash Out
+    70   // tempo5, ébullition
+  };     // Temporisation pour chaque myPaliers
 
   // Règlages par défaut du PID
   // Ces constantes sont correctes pour une cuve de 27L 2500W non isolée type kitchen chef
@@ -90,35 +90,37 @@ struct Config {
   float I_weak = 0.02;
   byte D_weak = 8;
 
-  byte PID_OFFSET = 1; // on ruse le PID pour lui faire décaller la température cible d'une valeur constante par exemple +1° donc si l'utilisateur vise 62° et que la température mesurée est de 61° le PID croit qu'il a atteint les 62° et coupe la chauffe. Ainsi l'overshoot est limité.
+  byte PID_OFFSET = 1;  // on ruse le PID pour lui faire décaller la température cible d'une valeur constante par exemple +1° donc si l'utilisateur vise 62° et que la température mesurée est de 61° le PID croit qu'il a atteint les 62° et coupe la chauffe. Ainsi l'overshoot est limité.
   // en théorie, avec les paramètres réglés au top, ce paramètre peut être remis à zéro.
 
   byte Beep_PIN = 40;
   byte ledPin = 13;
-
 };
 
 const char *filename = "/config.txt";  // <- SD library uses 8.3 filenames
 Config config;                         // <- global configuration object
 
 
-double Kp = config.P_strong; // multiplicateur de l'erreur différentielle de température.
-double Ki = config.I_strong; //coef de correction inverse
-double Kd = config.D_strong; //coef de dérivée
+double Kp = config.P_strong;  // multiplicateur de l'erreur différentielle de température.
+double Ki = config.I_strong;  //coef de correction inverse
+double Kd = config.D_strong;  //coef de dérivée
 
-#define DEBUG           // Décommenter pour afficher les informations de deboguage (PID sur le LCD)
+#define DEBUG  // Décommenter pour afficher les informations de deboguage (PID sur le LCD)
 #define MAX31865
 #define MAX31865_2
 
+// deux sondes
 float temp1;
 float temp2;
+// temperatures sous forme de char
+char temp1_char[6];
+char temp2_char[6];
 
-
-#define DEFIL           // Commenter pour ne pas faire alterner le texte sur la deuxième ligne pour afficher le temps restant total avant la fin de l'ébullition
-#define PIDDEBUG        // Commenter pour enlever l'information du PID sur l'écran lors de la chauffe
+#define DEFIL     // Commenter pour ne pas faire alterner le texte sur la deuxième ligne pour afficher le temps restant total avant la fin de l'ébullition
+#define PIDDEBUG  // Commenter pour enlever l'information du PID sur l'écran lors de la chauffe
 
 #ifdef PIDDEBUG
-#define PID_DEBUG(x) + String(x)
+#define PID_DEBUG(x) +String(x)
 #else
 #define PID_DEBUG(x)
 #endif
@@ -129,15 +131,17 @@ float temp2;
 #define DEBUGPRINTLN(x)
 #endif
 
-#define BLINK() ledState = !ledState; digitalWrite(config.ledPin, ledState);
+#define BLINK() \
+  ledState = !ledState; \
+  digitalWrite(config.ledPin, ledState);
 
 #ifdef DEFIL
-bool defilement = 0;    // Position du défilement / 1 = température et température à atteindre / 0 = température et temps restant / s'échange à chaque écriture sur la carte SD, donc toutes les 10 s environ
+bool defilement = 0;  // Position du défilement / 1 = température et température à atteindre / 0 = température et temps restant / s'échange à chaque écriture sur la carte SD, donc toutes les 10 s environ
 #endif
 
-byte DETECT = 2 , GATE = 3; //Broches utilisées pour le pilotage du triac -> detect : impulsion du passage au point zéro, gate : gachette du triac
-byte PULSE = 4  ; //triac gate pulse : largeur de l'impulsion pour activer le triac, en nombre de cycles d'horloge
-int HALF_WAVE = 560;// //nombre de "tics" d'horloge à chaque demi onde 50Hz . 625 théoriques, mais 560 réels .
+byte DETECT = 2, GATE = 3;  //Broches utilisées pour le pilotage du triac -> detect : impulsion du passage au point zéro, gate : gachette du triac
+byte PULSE = 4;             //triac gate pulse : largeur de l'impulsion pour activer le triac, en nombre de cycles d'horloge
+int HALF_WAVE = 560;        // //nombre de "tics" d'horloge à chaque demi onde 50Hz . 625 théoriques, mais 560 réels .
 
 #if defined(MAX31865)
 #include <Adafruit_MAX31865.h>
@@ -153,19 +157,19 @@ Adafruit_MAX31865 thermo2 = Adafruit_MAX31865(38, 39, 40, 41);
 // Adafruit_MAX31865 thermo = Adafruit_MAX31865(42);
 
 // The value of the Rref resistor. Use 430.0 for PT100 and 4300.0 for PT1000
-#define RREF      430.0
+#define RREF 430.0
 // The 'nominal' 0-degrees-C resistance of the sensor
 // 100.0 for PT100, 1000.0 for PT1000
-#define RNOMINAL  100.0
+#define RNOMINAL 100.0
 #endif
 
 // constantes pour les touches reliées au module LCD
-#define btnUP     22
-#define btnDOWN   23
-#define btnLEFT   24
-#define btnRIGHT  25
+#define btnUP 22
+#define btnDOWN 23
+#define btnLEFT 24
+#define btnRIGHT 25
 #define btnSELECT 26
-#define btnNONE   0
+#define btnNONE 0
 
 int btnUPValue = HIGH;
 int btnDOWNValue = HIGH;
@@ -176,46 +180,41 @@ int btnSELECTValue = HIGH;
 //  pins utilisées par le LCD
 jm_LCM2004A_I2C lcd(0x27);
 
-// valeurs utilisées pour configurer le LCD
-byte backLight   = 10;    // LCD Panel Backlight LED connected to digital pin 10
-int lcd_key     = 0;
-int adc_key_in  = 0;
+int lcd_key = 0;
 
 byte ledState = LOW;
 
 // variables du programme
 volatile unsigned int menu = 0;
 byte submenu = 0;
-byte startprog = 0; //marqueur pour indiquer que le programme s'éxécute
-byte jump = 0; //pour indiquer qu'on va sauter un menu
+byte startprog = 0;  //marqueur pour indiquer que le programme s'éxécute
+byte jump = 0;       //pour indiquer qu'on va sauter un menu
 
-byte annuler = 0; //pour annuler les opérations 0 = fonctionnement normal  / -1 on recule d'une étape / 1 on avance d'une étape
+byte annuler = 0;  //pour annuler les opérations 0 = fonctionnement normal  / -1 on recule d'une étape / 1 on avance d'une étape
 
 byte secondes = 0;
-unsigned long secondes_reel = 0; //temps écoulé depuis le début du programme, utilisé pour le data log
-unsigned int minutes = 0; //minutes écoulées
-unsigned long total_time = 0; //cumul des temps programme
-unsigned long temps_pause = 0; //si le programme est en pause, compte le temps écoulé
+unsigned long secondes_reel = 0;  //temps écoulé depuis le début du programme, utilisé pour le data log
+unsigned int minutes = 0;         //minutes écoulées
+unsigned long total_time = 0;     //cumul des temps programme
+unsigned long temps_pause = 0;    //si le programme est en pause, compte le temps écoulé
 bool palier_atteint = false;
-int logRecord_ID;   // Timer ID pour la fonction logRecord, pour un arrêt propre du programme (on veut le stopper avant d'arrêter le programme pour éviter toute écriture quand on ddébranche l'Arduino)
+int logRecord_ID;  // Timer ID pour la fonction logRecord, pour un arrêt propre du programme (on veut le stopper avant d'arrêter le programme pour éviter toute écriture quand on ddébranche l'Arduino)
 
-unsigned int cooling = 0; // compteur du temps de refroidissement
-
-//int therm; //variable pour le relevé de température
+unsigned int cooling = 0;  // compteur du temps de refroidissement
 
 // double chauffe_reel = 0, tx_chauffe, theta_mesure, theta_PID, theta_objectif = 20;
 float tx_chauffe;
 float theta_PID, theta_mesure, theta_objectif = 20;
 
-PID myPID((double*)&theta_PID, (double*)&tx_chauffe, (double*)&theta_objectif, Kp, Ki, Kd, DIRECT); //déclaration du PID
+PID myPID((double *)&theta_PID, (double *)&tx_chauffe, (double *)&theta_objectif, Kp, Ki, Kd, DIRECT);  //déclaration du PID
 
-#define BeepONState  LOW
-#define BeepOFFState  HIGH
+#define BeepONState LOW
+#define BeepOFFState HIGH
 #define BeepON(s) BeepON(s)
-byte beep_duration = 0;   // temps du bip : s / 128, 128 ms étant le temps entre chaque appel de sel_menu, la plus rapide des périodes pour vérifier que le bip est en route ou non
+byte beep_duration = 0;  // temps du bip : s / 128, 128 ms étant le temps entre chaque appel de sel_menu, la plus rapide des périodes pour vérifier que le bip est en route ou non
 void BeepON(unsigned int s) {
   digitalWrite(config.Beep_PIN, BeepONState);
-  beep_duration = (byte) ceil(s / 128);   // la durée du bip est comptée par période de 128 ms (arrondies à l'entier supérieur) - sel_menu, qui va vérifier si le bip est en route ou non, est appelée toutes les 128 ms
+  beep_duration = (byte)ceil(s / 128);  // la durée du bip est comptée par période de 128 ms (arrondies à l'entier supérieur) - sel_menu, qui va vérifier si le bip est en route ou non, est appelée toutes les 128 ms
 }
 void BeepOFF() {
   digitalWrite(config.Beep_PIN, BeepOFFState);
@@ -232,7 +231,7 @@ const uint8_t chipSelect = SS;
 
 // SD_FAT_TYPE = 0 for SdFat/File as defined in SdFatConfig.h,
 // 1 for FAT16/FAT32, 2 for exFAT, 3 for FAT16/FAT32 and exFAT.
-#define SD_FAT_TYPE 3
+#define SD_FAT_TYPE 1
 
 // Test with reduced SPI speed for breadboards.  SD_SCK_MHZ(4) will select
 // the highest speed supported by the board that is not over 4 MHz.
@@ -256,104 +255,73 @@ FsFile myFile;
 #error Invalid SD_FAT_TYPE
 #endif  // SD_FAT_TYPE
 
-String datalogFile; // Fichier de log, à chaque brassage différent
+// Call back for file timestamps.  Only called for file create and sync().
+void dateTime(uint16_t* date, uint16_t* time, uint8_t* ms10) {
+  DateTime now = rtc.now();
+
+  // Return date using FS_DATE macro to format fields.
+  *date = FS_DATE(now.year(), now.month(), now.day());
+
+  // Return time using FS_TIME macro to format fields.
+  *time = FS_TIME(now.hour(), now.minute(), now.second());
+
+  // Return low time bits in units of 10 ms.
+  *ms10 = now.second() & 1 ? 100 : 0;
+}
+
+
+char datalogFile[40];  // Fichier de log, à chaque brassage différent
+
+// padding with nothing
+char Char1[21];
+char Char2[21];
+char Char3[21];
+char Char4[21];
 
 char degre = (char)176;  // char 176 = ° (signe degré) en unicode
 
-void setTime()
-{
-
-  int setrtc[] = { now.day(), now.month(), now.year(), now.hour(), now.minute(), now.second()};
-  char item_ind[6][21] = {
-    "^^                 ",
-    "   ^^              ",
-    "      ^^^^         ",
-    "           ^^      ",
-    "              ^^   ",
-    "                 ^^"
-  };
-  int item = 0;
-  char str[21];
-
-  CLS();
-
-  lcd_key = btnNONE;
-  delay(1500);
-
-  while ( lcd_key != btnSELECT )
-  {
-
-    CLS();           // move to position 0 on the first line
-    lcd.print("Reglage date / heure");
-    lcd.setCursor(0, 1);           // move to position 0 on the second line
-    sprintf(str, "%02d-%02d-%04d %02dh%02dm%02d", setrtc[0], setrtc[1], setrtc[2], setrtc[3], setrtc[4], setrtc[5]);
-    lcd.print(str);
-    lcd.setCursor(0, 2);           // move to position 0 on the second line
-    lcd.print(item_ind[item] );
-    lcd.setCursor(0, 3);           // move to position 0 on the second line
-    lcd.print("<< >> ok>Select");
-
-    while ( lcd_key == btnNONE )
-    {
-      delay(200);
-      lcd_key = read_LCD_buttons();  // read the buttons
-    }
-
-    switch (lcd_key)
-    {
-      case btnNONE:
-        {
-          break;
-        }
-
-      case btnLEFT:
-        {
-          item = item - 1;
-          break;
-        }
-
-      case btnRIGHT:
-        {
-          item = item + 1;
-          break;
-        }
-
-      case btnDOWN:
-        {
-          DEBUGPRINTLN ("Down !");
-          setrtc[item] = setrtc[item] - 1;
-          break;
-        }
-
-      case btnUP:
-        {
-          DEBUGPRINTLN ("Up !");
-          setrtc[item] = setrtc[item] + 1;
-          break;
-        }
-
-      case btnSELECT:
-        {
-          DEBUGPRINTLN ("Change Time !");
-          rtc.adjust(DateTime(setrtc[2], setrtc[1], setrtc[0], setrtc[3], setrtc[4], setrtc[5]));
-          return;
-        }
-    }
-
-    lcd_key = btnNONE;
-
-  }
-}
-
-void setup()
-{
+void setup() {
 #if defined(DEBUG)
   Serial.begin(9600);
-  DEBUGPRINTLN  ("Startup ok");
+  DEBUGPRINTLN("Startup ok");
 #endif
 
-  DEBUGPRINTLN("Config : " + String(config.hysteresis_Pos));
-  
+
+  // ECRAN DE PRESENTATION ----------------------------
+  Wire.begin();
+  lcd.begin();
+
+  CLS();                          // move cursor to beginning of line "0"
+  lcd.print("initialise  SD  ");  // print a simple message
+  delay(600);
+  if (!sd.begin()) {
+    lcd.home();                    // move cursor to beginning of line "0"
+    lcd.print("ERREUR SD CARD ");  // print a simple message
+    delay(6000);
+  }
+
+  CLS();                         // move cursor to beginning of line "0"
+  lcd.print(" Lecture param ");  // print a simple message
+
+  if (sd.exists(filename)) {
+
+    // Should load default config if run for the first time
+    DEBUGPRINTLN("Loading configuration...");
+    loadConfiguration(filename, config);
+    DEBUGPRINTLN("Loaded...");
+  } else {
+
+    // Create configuration file
+    DEBUGPRINTLN("Saving configuration...");
+    saveConfiguration(filename, config);
+    DEBUGPRINTLN("Saved...");
+  }
+
+  // Dump config file
+  DEBUGPRINTLN("Print config file...");
+  printFile(filename);
+  DEBUGPRINTLN("End Print config file...");
+
   // setup buttons
   pinMode(btnUP, INPUT_PULLUP);
   pinMode(btnDOWN, INPUT_PULLUP);
@@ -361,47 +329,44 @@ void setup()
   pinMode(btnRIGHT, INPUT_PULLUP);
   pinMode(btnSELECT, INPUT_PULLUP);
 
-  // ECRAN DE PRESENTATION ----------------------------
-  Wire.begin();
-  lcd.begin();
 
-  if (! rtc.begin()) {
+  if (!rtc.begin()) {
     DEBUGPRINTLN("Couldn't find RTC");
-    while (1);
+    while (1)
+      ;
   }
-  if (! rtc.isrunning()) {
-    DEBUGPRINTLN ("RTC is NOT running!");
+  if (!rtc.isrunning()) {
+    DEBUGPRINTLN("RTC is NOT running!");
     // following line sets the RTC to the date & time this sketch was compiled
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-    // This line sets the RTC with an explicit date & time, for example to set
-    // January 21, 2014 at 3am you would call:
-    // rtc.adjust(DateTime(2022, 1, 21, 3, 0, 0));
-  }
-  else
-  {
-    DEBUGPRINTLN ("RTC is running!");
 
-    now = rtc.now();
+  } else {
+    DEBUGPRINTLN("RTC is running!");
 
-    sprintf(RtcTime, "%02dh%02dm%02d", now.hour(), now.minute(), now.second());
-    sprintf(RtcDate, "%02d-%02d-%04d", now.day(), now.month(), now.year());
+    // callback pour date sur les fichiers
+    FsDateTime::setCallback(dateTime);
 
-    DEBUGPRINTLN("Time" );
+    // rtc provider
+    setSyncProvider(time_provider);  //sets Time Library to RTC time
+    setSyncInterval(5);              //sync Time Library to RTC every 5 seconds
 
-    CLS();           // move to position 0 on the first line
+    sprintf(RtcTime, "%02ih%02im%02i", hour(), minute(), second());
+    sprintf(RtcDate, "%02i-%02i-%04i", day(), month(), year());
+
+    DEBUGPRINTLN("Time");
+
+    CLS();  // move to position 0 on the first line
     lcd.print("Date Heure OK ?");
-    lcd.setCursor(0, 1);           // move to position 0 on the second line
-    lcd.print(String(RtcDate) + " " + String( RtcTime));
-    lcd.setCursor(0, 3);           // move to position 0 on the second line
+    lcd.setCursor(0, 1);  // move to position 0 on the second line
+    lcd.print(String(RtcDate) + " " + String(RtcTime));
+    lcd.setCursor(0, 3);  // move to position 0 on the second line
     lcd.print("Select pour Changer!");
-    while ( lcd_key == btnNONE)
-    {
+    while (lcd_key == btnNONE) {
       delay(1000);
       lcd_key = read_LCD_buttons();  // read the buttons
     }
 
-    switch (lcd_key)
-    {
+    switch (lcd_key) {
       case btnNONE:
         {
           break;
@@ -409,25 +374,16 @@ void setup()
 
       case btnSELECT:
         {
-          DEBUGPRINTLN ("Change Time !");
-
-          rtc.adjust(DateTime(0, 0, 0, 0, 0, 0));
-          rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+          DEBUGPRINTLN("Change Time !");
 
           setTime();
 
-          now = rtc.now();
-
-          sprintf(RtcTime, "%02dh%02dm%02d", now.hour(), now.minute(), now.second());
-          sprintf(RtcDate, "%02d-%02d-%04d", now.day(), now.month(), now.year());
+          sprintf(RtcTime, "%02ih%02im%02i", hour(), minute(), second());
+          sprintf(RtcDate, "%02i-%02i-%04i", day(), month(), year());
           break;
         }
-
     }
-
-
   }
-
 
 #if defined(MAX31865)
   DEBUGPRINTLN("Adafruit MAX31865 PT100");
@@ -438,9 +394,6 @@ void setup()
   DEBUGPRINTLN("Adafruit MAX31865 PT100 Sonde 2");
   thermo2.begin(MAX31865_3WIRE);  // set to 3WIRE or 4WIRE as necessary
 #endif
-  //pinMode(53, OUTPUT); //la pin 53 est normalement attribuée à la fonction SPI Slave Select (SS)Permet d'activer ou désactiver le périphérique
-  // Suivant les modules SD, il peut être nécessaire de commenter cette ligne (c'est le cas de mon module même si c'est pas logique)
-
 
   // création des caractères spéciaux
   byte beer1[8] = {
@@ -464,9 +417,9 @@ void setup()
 
   lcd.createChar(0, beer1);
   lcd.createChar(1, beer2);
-  CLS();           // fonction qui efface le LCD et met le curseur au début
+  CLS();  // fonction qui efface le LCD et met le curseur au début
   lcd.print(" - GraiN.Master - ");
-  DEBUGPRINTLN  ("Print ok");
+  DEBUGPRINTLN("Print ok");
   lcd.setCursor(0, 1);
   lcd.write(byte(0));
   lcd.write(byte(1));
@@ -476,68 +429,29 @@ void setup()
   delay(2000);
 
   // set up des pins
-  pinMode(DETECT, INPUT);     //détection du passage au pont zéro / zero cross detect
-  digitalWrite(DETECT, HIGH); // enable pull-up resistor
-  pinMode(GATE, OUTPUT);      //triac gate control
+  pinMode(DETECT, INPUT);            //détection du passage au pont zéro / zero cross detect
+  digitalWrite(DETECT, HIGH);        // enable pull-up resistor
+  pinMode(GATE, OUTPUT);             //triac gate control
   pinMode(config.Beep_PIN, OUTPUT);  // Déclaration du bipper
 
-  pinMode(backLight, INPUT); //set backlight pin to input to avoid MCU overcurent on pin 10
-  // pinMode(11, OUTPUT);     // pin11 = MOSI sur uno
   pinMode(config.ledPin, OUTPUT);
 
   // set up Timer1
   //(see ATMEGA 328 data sheet pg 134 for more details)
-  OCR1A = 25;      //initialize the comparator
-  TIMSK1 = 0x03;    //enable comparator A and overflow interrupts
-  TCCR1A = 0x00;    //timer control registers set for
-  TCCR1B = 0x00;    //normal operation, timer disabled
+  OCR1A = 25;     //initialize the comparator
+  TIMSK1 = 0x03;  //enable comparator A and overflow interrupts
+  TCCR1A = 0x00;  //timer control registers set for
+  TCCR1B = 0x00;  //normal operation, timer disabled
 
   myPID.SetOutputLimits(0, 255);
 
-  // pinMode(10, OUTPUT);
-
-
-  CLS();          // move cursor to beginning of line "0"
-  lcd.print("initialise  SD  "); // print a simple message
-  delay(600);
-  if (!sd.begin(53)) {
-    lcd.home();           // move cursor to beginning of line "0"
-    lcd.print("ERREUR SD CARD "); // print a simple message
-    delay(6000);
-  }
-
-  CLS();           // move cursor to beginning of line "0"
-  lcd.print(" Lecture param "); // print a simple message
-  sd.remove(filename);
-  if ( sd.exists(filename)) {
-
-    // Should load default config if run for the first time
-    DEBUGPRINTLN("Loading configuration...");
-    loadConfiguration(filename, config);
-    DEBUGPRINTLN("Loaded...");
-  }
-  else
-  {
-
-    // Create configuration file
-    DEBUGPRINTLN("Saving configuration...");
-    saveConfiguration(filename, config);
-    DEBUGPRINTLN("Saved...");
-
-  }
-
-  // Dump config file
-  DEBUGPRINTLN("Print config file...");
-  printFile(filename);
-  DEBUGPRINTLN("End Print config file...");
-
-  datalogFile = "log_" + String(RtcDate) + "_" + String(RtcTime) + ".txt"; // Le nom du fichier, avec un numéro pseudo-aléatoire pour éviter de réécrire sur le même à chaque brassin
-  DEBUGPRINTLN("Datalogfile = " + datalogFile);
+  sprintf(datalogFile, "log_%s_%s.txt", RtcDate, RtcTime);
+  DEBUGPRINTLN(datalogFile);
 
   digitalWrite(config.ledPin, 1);
   myFile = sd.open(datalogFile, O_WRITE | O_CREAT | O_AT_END);
   if (myFile) {
-    DEBUGPRINTLN("Writing info to Datalogfile = " + datalogFile);
+    DEBUGPRINTLN("Writing info to Datalogfile");
     myFile.print("Temps (secondes)");
     myFile.print("; ");
     myFile.print("Palier en cours");
@@ -549,20 +463,18 @@ void setup()
     myFile.print("PID - taux de chauffe (0 - 255)");
     myFile.print('\n');
     myFile.close();
-  }
-  else
-  {
-    DEBUGPRINTLN("Error Writing info to Datalogfile = " + datalogFile);
+  } else {
+    DEBUGPRINTLN("Error Writing info to Datalogfile");
   }
 
   digitalWrite(config.ledPin, 0);
 
-  T.every(2205, lecture); // constante de temps pour le timer 1 - lecture de la sonde
-  T.every(128, sel_menu); // constante de temps pour le timer 2 - lecture des touches
-  T.every(1024, LCD_upd); // timer 3 - mise à jour écran
-  T.every(1000, horloge); // timer 4 - compte les secondes et minutes
-  T.every(350, regle_chauffe); //timer 5 - fréquence de mise à jour de la chauffe
-  logRecord_ID = T.every(10002, logRecord); //enregiste sur la carte SD
+  T.every(2205, lecture);                    // constante de temps pour le timer 1 - lecture de la sonde
+  T.every(128, sel_menu);                    // constante de temps pour le timer 2 - lecture des touches
+  T.every(1024, LCD_upd);                    // timer 3 - mise à jour écran
+  T.every(1000, horloge);                    // timer 4 - compte les secondes et minutes
+  T.every(350, regle_chauffe);               //timer 5 - fréquence de mise à jour de la chauffe
+  logRecord_ID = T.every(10002, logRecord);  //enregiste sur la carte SD
 
   OCR1A = 500;
   CLS();
@@ -573,31 +485,26 @@ void setup()
   //on rising signal
 
   menu = 0;
-
 }
 
 //Boucle principale ========================================
 
-void loop()
-{
+void loop() {
 
   T.update();
 
   //gestion des sauts d'étapes manuels
-  if (annuler == -1)
-  {
-    menu--; //on était au menu X on retourne au X-1
+  if (annuler == -1) {
+    menu--;  //on était au menu X on retourne au X-1
     annuler = 0;
     logRecord();
-  }
-  else {
-    if (annuler == 1)
-    {
+  } else {
+    if (annuler == 1) {
       menu++;
-      jump = 0; //par sécurité on ne veut pas de double saut au cas où le passage au palier suivant était prévu au même moment
+      jump = 0;  //par sécurité on ne veut pas de double saut au cas où le passage au palier suivant était prévu au même moment
       annuler = 0;
       logRecord();
-      palier_atteint = false; // le palier n'est pas encore atteint, il vient de commencer
+      palier_atteint = false;  // le palier n'est pas encore atteint, il vient de commencer
     }
   }
 
@@ -607,18 +514,17 @@ void loop()
     jump = 0;
     logRecord();
     BeepON(1500);
-    palier_atteint = false; // le palier n'est pas encore atteint, il vient de commencer
+    palier_atteint = false;  // le palier n'est pas encore atteint, il vient de commencer
   }
 
-} //fin Boucle principale =================================
+}  //fin Boucle principale =================================
 
 // Sélection de la température et du temps du palier
 void paliers_temp(int numpalier, String *line1, String *line2) {
   *line1 = config.myPaliers[0][numpalier] + " ? ";
   if (submenu == 0) {
     *line2 = " > T : " + String(config.myTemperatures[numpalier]) + degre + "  " + String(config.myTempo[numpalier]) + " min";
-  }
-  else {
+  } else {
     *line2 = " T : " + String(config.myTemperatures[numpalier]) + degre + " > " + String(config.myTempo[numpalier]) + " min";
   }
 }
@@ -643,12 +549,11 @@ void display_palier(int numpalier, String *line1, String *line2) {
   for (int i = 1; i <= numpalier; i++) {
     t += config.myTempo[i];
   }
-  DEBUGPRINTLN("t : " + String(t)+ " / minutes : " + String(minutes));
+  DEBUGPRINTLN("t : " + String(t) + " / minutes : " + String(minutes));
   // Si le temps n'est pas dépassé (t = temps total qu'il faut atteindre depuis le premier palier jusqu'à celui en cours)
   if (t > minutes) {
     config.myTempo[0] = t - minutes;
-  }
-  else {  // le palier est fini : on saute au palier suivant automatiquement
+  } else {  // le palier est fini : on saute au palier suivant automatiquement
     jump = 1;
     BeepON(200);
     palier_atteint = false;
@@ -659,20 +564,18 @@ void display_palier(int numpalier, String *line1, String *line2) {
   // on affiche un caractère différent s'il y a chauffe (" > ") ou si le palier a déjà été atteint (" : ")
   if (palier_atteint) {
     *line1 = *line1 + " : " + String(config.myTempo[0]) + " min";
-  }
-  else {
+  } else {
     *line1 = *line1 + " > " + String(config.myTempo[0]) + " min";
   }
 
   *line2 = String((int)theta_mesure) + " / " + String((int)config.myTemperatures[numpalier]);
 #ifdef DEFIL
-  if (defilement) { // on affiche alternativement la température en cours et la température à atteindre, ou...
+  if (defilement) {  // on affiche alternativement la température en cours et la température à atteindre, ou...
 #endif
     *line2 = *line2 + degre + "C ";
-    *line2 = *line2 PID_DEBUG("PID : " + String((int)ceil(tx_chauffe)) + "  "); // Ne va s'ajouter que si on active la fonction de debug (désactivation : enlever #define PIDDEBUG)
+    *line2 = *line2 PID_DEBUG("PID : " + String((int)ceil(tx_chauffe)) + "  ");  // Ne va s'ajouter que si on active la fonction de debug (désactivation : enlever #define PIDDEBUG)
 #ifdef DEFIL
-  }
-  else {  // ... la température en cours et le temps total restant estimé avant la fin de l'ébullition, sans le temps inter-palier néanmoins
+  } else {  // ... la température en cours et le temps total restant estimé avant la fin de l'ébullition, sans le temps inter-palier néanmoins
     t = 0;
     for (int i = numpalier + 1; i <= 6; i++) {
       t += config.myTempo[i];
@@ -681,17 +584,16 @@ void display_palier(int numpalier, String *line1, String *line2) {
     *line2 = *line2 + " REST : " + String(t) + "min";
   }
 #endif
-}   // Fin Display_palier
+}  // Fin Display_palier
 
-void LCD_upd() // affiche les infos à l'écran *********************************************************
+void LCD_upd()  // affiche les infos à l'écran *********************************************************
 {
   String Ligne1;
   String Ligne2;
   //  CLS(); // on efface l'écran et on place le curseur au début de la première ligne
 
-  switch (menu)
-  {
-    case 0:   // Sélection de température de préchauffage
+  switch (menu) {
+    case 0:  // Sélection de température de préchauffage
       {
         Ligne1 = config.myPaliers[0][menu] + " ? ";
         Ligne2 = " > T" + String(config.myTemperatures[0]) + degre + "C";
@@ -699,7 +601,7 @@ void LCD_upd() // affiche les infos à l'écran ********************************
       }
 
 
-    case 1:   // Sélection de températures des paliers 1 à 6 - inclus Mash-out et ébullition
+    case 1:  // Sélection de températures des paliers 1 à 6 - inclus Mash-out et ébullition
     case 2:
     case 3:
     case 4:
@@ -719,12 +621,12 @@ void LCD_upd() // affiche les infos à l'écran ********************************
         break;
       }
 
-    case 8:   // préchauffage
+    case 8:  // préchauffage
       {
         theta_objectif = config.myTemperatures[0];
         Ligne1 = config.myPaliers[1][0];
         Ligne2 = String((int)theta_mesure) + " / " + String((int)config.myTemperatures[0]) + degre + "C ";
-        Ligne2 = Ligne2 PID_DEBUG("PID : " + String(tx_chauffe)); // Ne va s'ajouter que si on active la fonction de debug (désactivation : commenter #define DEBUG)
+        Ligne2 = Ligne2 PID_DEBUG("PID : " + String(tx_chauffe));  // Ne va s'ajouter que si on active la fonction de debug (désactivation : commenter #define DEBUG)
         break;
       }
     case 9:   // palier 1
@@ -739,7 +641,7 @@ void LCD_upd() // affiche les infos à l'écran ********************************
         break;
       }
 
-    case 15: // refroidissement
+    case 15:  // refroidissement
       {
         Ligne1 = "Refroidissement";
         theta_objectif = 0;
@@ -748,7 +650,7 @@ void LCD_upd() // affiche les infos à l'écran ********************************
         break;
       }
 
-    case 109:   // Demander si on veut recommencer le palier en cours
+    case 109:  // Demander si on veut recommencer le palier en cours
     case 110:
     case 111:
     case 112:
@@ -759,14 +661,14 @@ void LCD_upd() // affiche les infos à l'écran ********************************
         break;
       }
 
-    case 115:   // Recommencer le refroidissement
+    case 115:  // Recommencer le refroidissement
       {
         Ligne1 = "RESTART REFROID ? ";
         Ligne2 = "SEL = OUI autre = NO";
         break;
       }
 
-    case 209:   // Demander si on veut passer le palier en cours
+    case 209:  // Demander si on veut passer le palier en cours
     case 210:
     case 211:
     case 212:
@@ -776,42 +678,38 @@ void LCD_upd() // affiche les infos à l'écran ********************************
         pass_palier(menu - 208, &Ligne1, &Ligne2);
         break;
       }
-    case 215:   // On a demander à passer le refroidissement : fin du brassage
+    case 215:  // On a demander à passer le refroidissement : fin du brassage
       {
         Ligne1 = "FIN DU BRASSAGE ? ";
         Ligne2 = "SEL = OUI autre = NO";
         break;
       }
-    default :
+    default:
       {
         Ligne1 = "Erreur de menu";
         Ligne2 = "menu " + String(menu);
         break;
       }
-
   }
-
-  // padding with nothing
-  char Char1[21];
-  char Char2[21];
 
   sprintf(Char1, "%-20s", Ligne1.c_str());
   sprintf(Char2, "%-20s", Ligne2.c_str());
+  sprintf(Char3, "T1:%s T2:%s", temp1_char, temp2_char);
 
   lcd.setCursor(0, 0);
   lcd.print(Char1);
   lcd.setCursor(0, 1);
   lcd.print(Char2);
   lcd.setCursor(0, 2);
-  lcd.print("T1 : " + String(temp1) + " T2: " + String(temp2));
+  lcd.print(Char3);
   lcd.setCursor(0, 3);
   lcd.print(String(RtcDate) + " " + String(RtcTime));
 
 
-} //************************************************************************************************************************************************************************FIN LCD
+}  //************************************************************************************************************************************************************************FIN LCD
 
 // read the buttons
-int read_LCD_buttons() //cette fonction renvoie la touche appuyée
+int read_LCD_buttons()  //cette fonction renvoie la touche appuyée
 {
   btnUPValue = digitalRead(btnUP);
   btnDOWNValue = digitalRead(btnDOWN);
@@ -819,17 +717,16 @@ int read_LCD_buttons() //cette fonction renvoie la touche appuyée
   btnRIGHTValue = digitalRead(btnRIGHT);
   btnSELECTValue = digitalRead(btnSELECT);
 
-  if (btnUPValue == LOW)   return btnUP;
-  if (btnDOWNValue == LOW)  return btnDOWN;
-  if (btnLEFTValue == LOW)  return btnLEFT;
-  if (btnRIGHTValue == LOW)  return btnRIGHT;
-  if (btnSELECTValue == LOW)  return btnSELECT;
+  if (btnUPValue == LOW) return btnUP;
+  if (btnDOWNValue == LOW) return btnDOWN;
+  if (btnLEFTValue == LOW) return btnLEFT;
+  if (btnRIGHTValue == LOW) return btnRIGHT;
+  if (btnSELECTValue == LOW) return btnSELECT;
 
   return btnNONE;  // when all others fail, return this...
-} // fin read the buttons
+}  // fin read the buttons
 
-float gettemp()
-{
+float gettemp() {
   float ttt;
 
 #if defined(MAX31865)
@@ -866,10 +763,9 @@ float gettemp()
       DEBUGPRINTLN("Under / Over voltage");
     }
     thermo.clearFault();
-  }
-  else
-  {
+  } else {
     temp1 = thermo.temperature(RNOMINAL, RREF);
+    dtostrf(temp1, 3, 1, temp1_char);
     ttt = temp1;
   }
 #endif
@@ -908,44 +804,47 @@ float gettemp()
       DEBUGPRINTLN("Under / Over voltage");
     }
     thermo2.clearFault();
-  }
-  else
-  {
+  } else {
     temp2 = thermo2.temperature(RNOMINAL, RREF);
-    ttt = ( temp1 + temp2 ) / 2 ;
+    if (temp2 < 0) {
+      temp2 = 0;
+    }
+    else
+    {
+    dtostrf(temp2, 3, 1, temp2_char);
+    ttt = (temp1 + temp2) / 2;
+    }
   }
 #endif
 
-  myPID.Compute(); //on Lance un calcul du PID. le calcul se fait en même temps que le rafraichissement des variables de température
+  myPID.Compute();  //on Lance un calcul du PID. le calcul se fait en même temps que le rafraichissement des variables de température
 
   return ttt;
 }
 
-void CLS() // efface l'écran et place le curseur au début de la première ligne
+void CLS()  // efface l'écran et place le curseur au début de la première ligne
 {
   lcd.clear();
   lcd.setCursor(0, 0);
 }
 
-void horloge() //fonction appelée une fois par seconde . On profite de cette fonction pour certaines fonctionalités actualisées une fois par seconde
+void horloge()  //fonction appelée une fois par seconde . On profite de cette fonction pour certaines fonctionalités actualisées une fois par seconde
 {
 
-  now = rtc.now();
-
-  sprintf(RtcTime, "%02dh%02dm%02d", now.hour(), now.minute(), now.second());
-  sprintf(RtcDate, "%02d-%02d-%04d", now.day(), now.month(), now.year());
+  sprintf(RtcTime, "%02ih%02im%02i", hour(), minute(), second());
+  sprintf(RtcDate, "%02i-%02i-%04i", day(), month(), year());
 
   secondes_reel++;
 
-  if (palier_atteint) { // on incrémente le compteur minutes toutes les 60s, mais seulement si on a atteint le palier - permet d'éviter les erreurs de mesure de la sonde qui parfois affiche des valeurs farfelues :
+  if (palier_atteint) {  // on incrémente le compteur minutes toutes les 60s, mais seulement si on a atteint le palier - permet d'éviter les erreurs de mesure de la sonde qui parfois affiche des valeurs farfelues :
     // si la lecture de la sonde de température donne quelque chose de négatif au moment où on rentre dans ce sous-programme, on pourrait ne pas incrémenter les minutes, et donc faire durer trop longtemps le palier
 
-    secondes++; //on compte le temps écoulé pendant que le palier est en cours
+    secondes++;  //on compte le temps écoulé pendant que le palier est en cours
 
-    BLINK(); //on fait clignoter une fois par seconde pour montrer que le palier est lancé
+    BLINK();  //on fait clignoter une fois par seconde pour montrer que le palier est lancé
   }
 
-  if (theta_objectif == 0) //cas uniquement présent lors du refroidissement
+  if (theta_objectif == 0)  //cas uniquement présent lors du refroidissement
   {
     secondes++;
   }
@@ -960,36 +859,32 @@ void horloge() //fonction appelée une fois par seconde . On profite de cette fo
     }
   }
 
-  if (theta_mesure > (theta_objectif - config.hysteresis_Neg) && theta_mesure < (theta_objectif + config.hysteresis_Pos)) // si on est compris entre les deux valeurs d'hysteresis, on est dans la bonne plage de température. on réduit la force du PID
+  if (theta_mesure > (theta_objectif - config.hysteresis_Neg) && theta_mesure < (theta_objectif + config.hysteresis_Pos))  // si on est compris entre les deux valeurs d'hysteresis, on est dans la bonne plage de température. on réduit la force du PID
   {
-    Kp = config.P_weak; // multiplicateur de l'erreur différentielle de température.
-    Ki = config.I_weak; //coef de correction intégrale
-    Kd = config.D_weak; //coef de dérivée
+    Kp = config.P_weak;  // multiplicateur de l'erreur différentielle de température.
+    Ki = config.I_weak;  //coef de correction intégrale
+    Kd = config.D_weak;  //coef de dérivée
 
-  }
-  else {
-    Kp = config.P_strong; // multiplicateur de l'erreur différentielle de température. 1° d'écart = Kp% de chauffe
-    Ki = config.I_strong; //coef de correction intégrale
-    Kd = config.D_strong; //coef de dérivée
+  } else {
+    Kp = config.P_strong;  // multiplicateur de l'erreur différentielle de température. 1° d'écart = Kp% de chauffe
+    Ki = config.I_strong;  //coef de correction intégrale
+    Kd = config.D_strong;  //coef de dérivée
   }
   myPID.SetTunings(Kp, Ki, Kd);
 }
 
-void lecture()
-{
+void lecture() {
   theta_mesure = gettemp();
   if (theta_mesure > (theta_objectif - config.hysteresis_Neg) && theta_mesure < (theta_objectif + config.hysteresis_Pos)) {
-    theta_PID = theta_mesure; // si on est proche de la température de consigne, on supprime l'offset de sécurité
-    palier_atteint = true;    // on annonce que le palier est atteint : c'est lui qui va déterminer si on va incrémenter les minutes pour le palier en cours, pour éviter les erreurs de mesure de la sonde
-  }
-  else {
+    theta_PID = theta_mesure;  // si on est proche de la température de consigne, on supprime l'offset de sécurité
+    palier_atteint = true;     // on annonce que le palier est atteint : c'est lui qui va déterminer si on va incrémenter les minutes pour le palier en cours, pour éviter les erreurs de mesure de la sonde
+  } else {
     // Si on n'est pas à l'ébullition...
     if (menu != 14) {
       theta_PID = theta_mesure + config.PID_OFFSET;
     } else {
       theta_PID = theta_mesure;
     }
-
   }
 }
 
@@ -1006,21 +901,21 @@ void start_brew() {
     DEBUGPRINTLN("Temps palier[" + String(i) + "] : " + String(config.myTempo[i]));
   }
   DEBUGPRINTLN("Temps total prévu : " + String(total_time));
-  CLS();           // move to position 0 on the first line
+  CLS();  // move to position 0 on the first line
   lcd.print("    BRASSAGE    ");
-  lcd.setCursor(0, 1);           // move to position 0 on the second line
+  lcd.setCursor(0, 1);  // move to position 0 on the second line
   lcd.print("    IMMINENT !  ");
   delay(800);
   CLS();
   lcd.print("Duree prevue :  ");
-  lcd.setCursor(0, 1);           // move to position 0 on the second line
+  lcd.setCursor(0, 1);  // move to position 0 on the second line
   lcd.print(total_time);
   lcd.print(" min");
   delay(1000);
 
   digitalWrite(config.ledPin, LOW);
 
-  menu = 8; //saute au menu suivant (départ programme)
+  menu = 8;  //saute au menu suivant (départ programme)
   CLS();
   LCD_upd();
 
@@ -1028,16 +923,14 @@ void start_brew() {
 }
 
 // +++++++++++++++++++++++++++++++++++++++++       GESTION DES MENUS                   ++++++++++++++++++++++++++++++++++++++++++++++
-void sel_menu()
-{
+void sel_menu() {
 
   byte m;
 
   lcd_key = read_LCD_buttons();  // read the buttons
 
-  if (menu >= 100) { // gestion des sauts de programme en cas d'annulation la valeur est >100  en cas de saut menu > 200
-    switch (lcd_key)
-    {
+  if (menu >= 100) {  // gestion des sauts de programme en cas d'annulation la valeur est >100  en cas de saut menu > 200
+    switch (lcd_key) {
       case btnNONE:
         {
           break;
@@ -1045,8 +938,7 @@ void sel_menu()
 
       case btnSELECT:
         {
-          switch (menu)
-          {
+          switch (menu) {
             case 108:
               {
                 CLS();
@@ -1055,33 +947,33 @@ void sel_menu()
                 delay(150);
                 break;
               }
-            case 109: //on a demandé à recommencer l'étape palier 1
-            case 110: //on a demandé à recommencer l'étape palier 2
-            case 111: //on a demandé à recommencer l'étape palier 3
-            case 112: //on a demandé à recommencer l'étape palier 4
-            case 113: //on a demandé à recommencer l'étape rincage mash out
-            case 114: //on a demandé à recommencer l'étape ébu
-            case 115: //on a demandé à recommencer l'étape refroidissement/whirlpool
+            case 109:  //on a demandé à recommencer l'étape palier 1
+            case 110:  //on a demandé à recommencer l'étape palier 2
+            case 111:  //on a demandé à recommencer l'étape palier 3
+            case 112:  //on a demandé à recommencer l'étape palier 4
+            case 113:  //on a demandé à recommencer l'étape rincage mash out
+            case 114:  //on a demandé à recommencer l'étape ébu
+            case 115:  //on a demandé à recommencer l'étape refroidissement/whirlpool
               {
                 m = menu - 108;
                 CLS();
-                annuler = -1; // on était au menu X (menu - 109) on retourne au X-1 (menu - 110)
-                minutes = 0;  //avant le palier 1 (donc l'étape de préchauffage) le temps écoulé était à 0, et
+                annuler = -1;  // on était au menu X (menu - 109) on retourne au X-1 (menu - 110)
+                minutes = 0;   //avant le palier 1 (donc l'étape de préchauffage) le temps écoulé était à 0, et
                 //avant le palier 2 (donc le palier 1) le temps écoulé était aussi égal à 0
 
                 config.myTempo[0] = 0;
 
 
-                for (int i = m; i >= 2; i--) { // on ne réinitialise les minutes que pour les paliers > 1
-                  minutes += config.myTempo[(i - 1)];    // on rajoute les durées des paliers précédents uniquement, car on recommence au début du palier m
+                for (int i = m; i >= 2; i--) {         // on ne réinitialise les minutes que pour les paliers > 1
+                  minutes += config.myTempo[(i - 1)];  // on rajoute les durées des paliers précédents uniquement, car on recommence au début du palier m
                 }
                 cooling = minutes;
                 delay(150);
-                palier_atteint = false;   // on ne sait jamais, on va prétendre que la température du palier n'a pas été atteinte
+                palier_atteint = false;  // on ne sait jamais, on va prétendre que la température du palier n'a pas été atteinte
                 break;
               }
 
-            case 208: //on a demandé à sauter l'étape préchauffage (ne devrait pas arriver)
+            case 208:  //on a demandé à sauter l'étape préchauffage (ne devrait pas arriver)
               {
                 CLS();
                 lcd.print("saut erreur 208");
@@ -1092,65 +984,64 @@ void sel_menu()
                 break;
               }
 
-            case 209: //on a demandé à sauter l'étape palier 1
-            case 210: //on a demandé à sauter l'étape palier 2
-            case 211: //on a demandé à sauter l'étape palier 3
-            case 212: //on a demandé à sauter l'étape palier 4
-            case 213: //on a demandé à sauter l'étape mash out
-            case 214: //on a demandé à sauter l'étape ebullition
+            case 209:  //on a demandé à sauter l'étape palier 1
+            case 210:  //on a demandé à sauter l'étape palier 2
+            case 211:  //on a demandé à sauter l'étape palier 3
+            case 212:  //on a demandé à sauter l'étape palier 4
+            case 213:  //on a demandé à sauter l'étape mash out
+            case 214:  //on a demandé à sauter l'étape ebullition
               {
                 m = menu - 208;
                 minutes = 0;
-                for (int i = m; i >= 1; i--) { // on ne réinitialise les minutes que pour les paliers > 1
-                  minutes += config.myTempo[i];    // on rajoute les durées des paliers précédents et du palier en cours, car on va recommencer au début du palier m + 1
+                for (int i = m; i >= 1; i--) {   // on ne réinitialise les minutes que pour les paliers > 1
+                  minutes += config.myTempo[i];  // on rajoute les durées des paliers précédents et du palier en cours, car on va recommencer au début du palier m + 1
                 }
                 config.myTempo[0] = 0;
                 jump = 0;
                 annuler = 1;
-                cooling = minutes; // sauter l'étape ébullition (cooling sera mis à jour de toute façon quand on sera à la fin de l'ébullition, pas de problème à l'écraser maintenant)
+                cooling = minutes;  // sauter l'étape ébullition (cooling sera mis à jour de toute façon quand on sera à la fin de l'ébullition, pas de problème à l'écraser maintenant)
                 delay(150);
-                palier_atteint = false;   // on ne sait jamais, on va prétendre que la température du palier n'a pas été atteinte
+                palier_atteint = false;  // on ne sait jamais, on va prétendre que la température du palier n'a pas été atteinte
                 break;
               }
-            case 215:   // on a fini le brassage : on demande à "sauter" le refroidissement/whirlpool pour finir dans un état permettant d'arrêter proprement l'automate
+            case 215:  // on a fini le brassage : on demande à "sauter" le refroidissement/whirlpool pour finir dans un état permettant d'arrêter proprement l'automate
               {
-                T.stop(logRecord_ID); // On arrête le timer lié à l'écriture sur la carte SD, pour éviter qu'une écriture impromptue ne soit en cours quand on débranche l'Arduino
-                logRecord();  // On appelle pour la dernière fois l'écriture sur la carte SD, pour logger la fin du brassage (dernier événement du log)
+                T.stop(logRecord_ID);  // On arrête le timer lié à l'écriture sur la carte SD, pour éviter qu'une écriture impromptue ne soit en cours quand on débranche l'Arduino
+                logRecord();           // On appelle pour la dernière fois l'écriture sur la carte SD, pour logger la fin du brassage (dernier événement du log)
                 CLS();
                 lcd.print("Fin de BRASSAGE");
                 lcd.setCursor(0, 1);
                 lcd.print("!!! HAVE FUN !!!");
                 delay(800);
-                while (1);  // Arrêt propre : plus aucune action ne sera réalisée par la suite (donc pas d'erreur d'écriture sur carte SD par exemple)
+                while (1)
+                  ;  // Arrêt propre : plus aucune action ne sera réalisée par la suite (donc pas d'erreur d'écriture sur carte SD par exemple)
                 break;
               }
               break;
-          } //fin switch menu
-        }//fin bouton select
+          }  //fin switch menu
+        }    //fin bouton select
 
-      case btnUP: // on annule le saut
-      case btnDOWN: // on annule le saut
-      case btnLEFT: // on annule le saut
-      case btnRIGHT: // on annule le saut
+      case btnUP:     // on annule le saut
+      case btnDOWN:   // on annule le saut
+      case btnLEFT:   // on annule le saut
+      case btnRIGHT:  // on annule le saut
         {
           CLS();
           jump = 0;
           delay(500);
-          if (menu > 199)
-          {
+          if (menu > 199) {
             menu -= 200;
-          }
-          else {
+          } else {
             menu -= 100;
           }
           break;
         }
         break;
-    }// fin switch lcd key
-  } else { //Si on n'a pas demandé de saut
+    }       // fin switch lcd key
+  } else {  //Si on n'a pas demandé de saut
 
     // gestion des menus
-    switch (lcd_key)               // depending on which button was pushed, we perform an action
+    switch (lcd_key)  // depending on which button was pushed, we perform an action
     {
 
       case btnNONE:
@@ -1161,49 +1052,46 @@ void sel_menu()
       case btnUP:
         {
 
-          if (startprog == 0) //si on est encore en phase de programation, on peut naviguer du menu 0 à 7
+          if (startprog == 0)  //si on est encore en phase de programation, on peut naviguer du menu 0 à 7
           {
-            if (menu < 7)
-            {
+            if (menu < 7) {
               menu++;
 
               delay(150);
               LCD_upd();
             }
-          }
-          else { //le programme est lancé
-            if (menu > 7) // On demande à sauter l'étape en cours
+          } else {         //le programme est lancé
+            if (menu > 7)  // On demande à sauter l'étape en cours
             {
 
 
-              if (menu >= 9 && menu < 16) //si on est au menu 9 ou + on considère que c'est un saut de programme (y inclus pour le refroidissement, pour la fin du programme)
+              if (menu >= 9 && menu < 16)  //si on est au menu 9 ou + on considère que c'est un saut de programme (y inclus pour le refroidissement, pour la fin du programme)
               {
                 // small_Beep = 1;
                 BeepON(200);
 
                 menu += 200;
               }
-              if (menu == 8) menu ++; //si on est dans le menu 8 (préchauffe) , le saut est autorisé sans condition
+              if (menu == 8) menu++;  //si on est dans le menu 8 (préchauffe) , le saut est autorisé sans condition
               delay(150);
               LCD_upd();
             }
 
-          }//fin else
+          }  //fin else
           break;
         }
       case btnDOWN:
         {
 
-          if (startprog == 0) //si on est encore en phase de programation, on peut naviguer du 7 à 0
+          if (startprog == 0)  //si on est encore en phase de programation, on peut naviguer du 7 à 0
           {
             if (menu > 0) {
               menu--;
               delay(150);
               LCD_upd();
             }
-          }
-          else {
-            if (menu > 8) { //si on est en phase brassage (a partir de menu 9)
+          } else {
+            if (menu > 8) {  //si on est en phase brassage (a partir de menu 9)
 
               // DEMANDER SI ON SOUHAITE RECOMMENCER L'ETAPE EN COURS
               // small_Beep = 1;
@@ -1213,7 +1101,6 @@ void sel_menu()
               delay(150);
               LCD_upd();
             }
-
           }
 
           break;
@@ -1221,52 +1108,49 @@ void sel_menu()
       case btnLEFT:
         {
           //faire un switch menu
-          switch (menu)
-          {
-            case 0: //menu température de préchauffe
-            case 1: //menu réglage palier 1
-            case 2: //menu réglage palier 2
-            case 3: //menu réglage palier 3
-            case 4: //menu réglage palier 4
+          switch (menu) {
+            case 0:  //menu température de préchauffe
+            case 1:  //menu réglage palier 1
+            case 2:  //menu réglage palier 2
+            case 3:  //menu réglage palier 3
+            case 4:  //menu réglage palier 4
             case 5:  //menu réglage Mash out - rinçage
-            case 6: // ébullition
+            case 6:  // ébullition
               {
                 if (submenu == 0) {
                   if (config.myTemperatures[menu] > 20) config.myTemperatures[menu] -= 0.5;
-                }
-                else {
+                } else {
                   if (config.myTempo[menu] > 0) config.myTempo[menu]--;
                 }
                 LCD_upd();
                 break;
               }
 
-            case 7: //sauvegarde
+            case 7:  //sauvegarde
               {
                 break;
               }
-            case 8: //préchauffe
-            case 9: //palier 1
-            case 10://palier 2
-            case 11://palier 3
-            case 12://palier 4
-            case 13://rinçage - mash-out
-            case 14://ébullition
+            case 8:   //préchauffe
+            case 9:   //palier 1
+            case 10:  //palier 2
+            case 11:  //palier 3
+            case 12:  //palier 4
+            case 13:  //rinçage - mash-out
+            case 14:  //ébullition
               {
                 m = menu - 8;
                 DEBUGPRINTLN("Valeur submenu pour le menu " + String(m) + " : " + String(submenu));
                 if (submenu == 0) {
                   if (config.myTemperatures[m] > 20) config.myTemperatures[m] -= 0.5;
-                }
-                else {
+                } else {
                   if (config.myTempo[m] > 2) config.myTempo[m]--;
                 }
                 LCD_upd();
                 break;
               }
 
-            case 15://mode manuel
-            case 16://mode erreur
+            case 15:  //mode manuel
+            case 16:  //mode erreur
               {
                 break;
               }
@@ -1276,54 +1160,50 @@ void sel_menu()
       case btnRIGHT:
         {
           //faire un switch menu
-          switch (menu)
-          {
-            case 0: //menu température de préchauffe
-            case 1: //menu réglage palier 1
-            case 2: //menu réglage palier 2
-            case 3: //menu réglage palier 3
-            case 4: //menu réglage palier 4
+          switch (menu) {
+            case 0:  //menu température de préchauffe
+            case 1:  //menu réglage palier 1
+            case 2:  //menu réglage palier 2
+            case 3:  //menu réglage palier 3
+            case 4:  //menu réglage palier 4
             case 5:  //menu réglage Mash out - rinçage
-            case 6: // ébullition
+            case 6:  // ébullition
               {
                 if (submenu == 0) {
                   if (config.myTemperatures[menu] <= 110) config.myTemperatures[menu] += 0.5;
-                }
-                else {
+                } else {
                   config.myTempo[menu]++;
                 }
                 LCD_upd();
                 break;
-
               }
 
-            case 7: // On a demandé à ne pas faire la sauvegarde
+            case 7:  // On a demandé à ne pas faire la sauvegarde
               {
                 start_brew();
                 break;
               }
-            case 8: //préchauffe
-            case 9: //palier 1
-            case 10://palier 2
-            case 11://palier 3
-            case 12://palier 4
-            case 13://rinçage mash out
-            case 14://ébullition
+            case 8:   //préchauffe
+            case 9:   //palier 1
+            case 10:  //palier 2
+            case 11:  //palier 3
+            case 12:  //palier 4
+            case 13:  //rinçage mash out
+            case 14:  //ébullition
               {
                 m = menu - 8;
                 DEBUGPRINTLN("Valeur submenu pour le menu " + String(m) + " : " + String(submenu));
                 if (submenu == 0) {
                   if (config.myTemperatures[m] < 110) config.myTemperatures[m] += 0.5;
-                }
-                else {
+                } else {
                   config.myTempo[m]++;
                 }
                 LCD_upd();
                 break;
               }
 
-            case 15://mode manuel
-            case 16://mode erreur
+            case 15:  //mode manuel
+            case 16:  //mode erreur
               {
                 break;
               }
@@ -1331,7 +1211,7 @@ void sel_menu()
               {
                 CLS();
                 lcd.print("Erreur de menu");
-                lcd.setCursor(0, 1);           // move to position 0 on the second line
+                lcd.setCursor(0, 1);  // move to position 0 on the second line
                 lcd.print("menu ");
                 lcd.print(menu);
                 break;
@@ -1341,28 +1221,27 @@ void sel_menu()
         }
       case btnSELECT:
         {
-          switch (menu)
-          {
+          switch (menu) {
 
-            case 1: // menu paliers 1 à 4
+            case 1:  // menu paliers 1 à 4
             case 2:
             case 3:
             case 4:
-            case 6: // ébullition
+            case 6:  // ébullition
               {
                 submenu = !submenu;
                 LCD_upd();
                 break;
               }
 
-            case 0: //menu température de préchauffe
-            case 5: //menu rinçage
+            case 0:  //menu température de préchauffe
+            case 5:  //menu rinçage
               {
                 LCD_upd();
                 break;
               }
 
-            case 7: // sauvegarde
+            case 7:  // sauvegarde
               {
 
                 digitalWrite(config.ledPin, HIGH);
@@ -1370,7 +1249,7 @@ void sel_menu()
                 saveConfiguration(filename, config);
 
                 myFile = sd.open(datalogFile, O_WRITE | O_CREAT | O_AT_END);
-                DEBUGPRINTLN("Write on " + datalogFile);
+
                 if (myFile) {
                   myFile.print("----GraiN.Master----\n");
                   myFile.print(version);
@@ -1390,15 +1269,13 @@ void sel_menu()
                   myFile.print("\n\n");
                   myFile.print("Temps (s), Température cible °C, Température °C, PID (0 - 255)\n");
                   myFile.close();
-                }
-                else
-                {
-                  DEBUGPRINTLN("Error Writing info to Datalogfile = " + datalogFile);
+                } else {
+                  DEBUGPRINTLN("Error Writing info to Datalogfile");
                 }
 
                 DEBUGPRINTLN("----GraiN.Master----");
                 DEBUGPRINTLN(version);
-                DEBUGPRINTLN("Température de départ : " + String(config.myTemperatures[0]) + "°C"  );
+                DEBUGPRINTLN("Température de départ : " + String(config.myTemperatures[0]) + "°C");
 
 #ifdef DEBUG
                 for (int i = 1; i < 7; i++) {
@@ -1406,26 +1283,25 @@ void sel_menu()
                   DEBUGPRINTLN(String(config.myTempo[i]) + " min - " + String(config.myTemperatures[i]) + "°C");
                 }
 #endif
-                lcd.home();           // move to position 0 on the first line
+                lcd.home();  // move to position 0 on the first line
                 lcd.print("    PROGRAMME   ");
-                lcd.setCursor(0, 1);           // move to position 0 on the second line
+                lcd.setCursor(0, 1);  // move to position 0 on the second line
                 lcd.print("   SAUVEGARDE ! ");
 
 
                 delay(600);
                 start_brew();
                 break;
-
               }
-            case 8: //palier 1
-            case 9: //palier 2
-            case 10: //palier 3
-            case 11://palier 3
-            case 12://palier 4
-            case 13://rinçage - mash-out
-            case 14://ébullition
+            case 8:   //palier 1
+            case 9:   //palier 2
+            case 10:  //palier 3
+            case 11:  //palier 3
+            case 12:  //palier 4
+            case 13:  //rinçage - mash-out
+            case 14:  //ébullition
               {
-                submenu = !submenu;   // Permet de modifier la durée ou la température du palier en cours
+                submenu = !submenu;  // Permet de modifier la durée ou la température du palier en cours
                 break;
               }
 
@@ -1433,38 +1309,36 @@ void sel_menu()
               {
                 CLS();
                 lcd.print("Erreur de menu");
-                lcd.setCursor(0, 1);           // move to position 0 on the second line
+                lcd.setCursor(0, 1);  // move to position 0 on the second line
                 lcd.print("menu ");
                 lcd.print(menu);
                 break;
               }
 
               break;
-          } //fin switch menu
+          }  //fin switch menu
           break;
-        } //fin buton select
+        }  //fin buton select
 
 
       default:
         {
           CLS();
           lcd.print("Erreur de menu");
-          lcd.setCursor(0, 1);           // move to position 0 on the second line
+          lcd.setCursor(0, 1);  // move to position 0 on the second line
           lcd.print("menu ");
           lcd.print(menu);
           break;
         }
 
         break;
-    } //fin switch lcd key
-  } //fin du else (pas de saut)
+    }  //fin switch lcd key
+  }    //fin du else (pas de saut)
 }
 
-void regle_chauffe()
-{
+void regle_chauffe() {
 
-  if (tx_chauffe >= 250)
-  {
+  if (tx_chauffe >= 250) {
     // Si on est dans un des paliers de chauffe, on veut une courbe de température douce, qui gagne environ 1° toutes les minutes (pour éviter de violenter notre moût), le TRIAC à fond va beaucoup plus fort
     // On ne modifie pas tx_chauffe pour éviter tout effet de bord
     // Ce n'est valide que si le palier n'a pas été atteint. Si ce n'est pas le cas, c'est qu'on a eu une brusque chute de température lors du palier et qu'il faut au plus vite revenir à notre température !
@@ -1476,76 +1350,67 @@ void regle_chauffe()
     else {
       FULL_ON();
     }
-  }
-  else {
+  } else {
 
-    if (tx_chauffe <= 5)
-    {
+    if (tx_chauffe <= 5) {
       FULL_OFF();
-    }
-    else
-    {
+    } else {
       PROPORTIONNAL();
       Triac_pilot(Power_out(tx_chauffe));
     }
   }
-
 }
 //Interrupt Service Routines
 
-void zeroCrossingInterrupt() { //zero cross detect
-  TCCR1B = 0x04; //start timer with divide by 256 input
-  TCNT1 = 0;   //reset timer - count from zero
+void zeroCrossingInterrupt() {  //zero cross detect
+  TCCR1B = 0x04;                //start timer with divide by 256 input
+  TCNT1 = 0;                    //reset timer - count from zero
 }
 
-ISR(TIMER1_COMPA_vect) { //comparator match
-  digitalWrite(GATE, HIGH); //set triac gate to high
-  TCNT1 = 65536 - PULSE;    //trigger pulse width
+ISR(TIMER1_COMPA_vect) {     //comparator match
+  digitalWrite(GATE, HIGH);  //set triac gate to high
+  TCNT1 = 65536 - PULSE;     //trigger pulse width
 }
 
-ISR(TIMER1_OVF_vect) { //timer1 overflow
-  digitalWrite(GATE, LOW); //turn off triac gate
-  TCCR1B = 0x00;          //disable timer stopd unintended triggers
+ISR(TIMER1_OVF_vect) {      //timer1 overflow
+  digitalWrite(GATE, LOW);  //turn off triac gate
+  TCCR1B = 0x00;            //disable timer stopd unintended triggers
 }
 
-void Triac_pilot(int conduction_time) { // pilote le triac
+void Triac_pilot(int conduction_time) {  // pilote le triac
   if (conduction_time > HALF_WAVE) conduction_time = HALF_WAVE;
-  OCR1A = conduction_time;     //set the compare register brightness desired.
+  OCR1A = conduction_time;  //set the compare register brightness desired.
 }
 
 
-int Power_out(int Power) //calcule le temps de conduction nécessaire pour obtenir la puissance demandée. Power va de 0 à 255
+int Power_out(int Power)  //calcule le temps de conduction nécessaire pour obtenir la puissance demandée. Power va de 0 à 255
 {
 
   int CT;
   CT = 540 - (Power * 2);
   return CT;
 }
-void FULL_ON()
-{
+void FULL_ON() {
   // set up zero crossing interrupt
   detachInterrupt(digitalPinToInterrupt(2));  // équivalent à 0
   digitalWrite(GATE, HIGH);
   //IRQ0 is pin 2
 }
-void FULL_OFF()
-{
+void FULL_OFF() {
   // set up zero crossing interrupt
   detachInterrupt(digitalPinToInterrupt(2));  // équivalent à 0
   digitalWrite(GATE, LOW);
   //IRQ0 is pin 2
 }
 
-void PROPORTIONNAL()
-{
+void PROPORTIONNAL() {
   attachInterrupt(digitalPinToInterrupt(2), zeroCrossingInterrupt, CHANGE);
 }
 
-void logRecord()
-{
+void logRecord() {
   byte numpalier = 0;
 #ifdef DEFIL
-  defilement = !defilement;    // Position du défilement / 1 = température et température à atteindre / 0 = température et temps restant / s'échange à chaque écriture sur la carte SD, donc toutes les 10 s environ
+  defilement = !defilement;  // Position du défilement / 1 = température et température à atteindre / 0 = température et temps restant / s'échange à chaque écriture sur la carte SD, donc toutes les 10 s environ
 #endif
   if (menu > 200)
     numpalier = menu - 208;
@@ -1555,7 +1420,7 @@ void logRecord()
     numpalier = 0;
   else numpalier = menu - 8;
   digitalWrite(config.ledPin, 1);
-  myFile = sd.open(datalogFile, O_WRITE | O_CREAT | O_AT_END);
+  myFile = sd.open(datalogFile, FILE_WRITE);
   if (myFile) {
     myFile.println("\nDate / Heure : " + String(RtcDate) + " " + String(RtcTime));
     myFile.print(secondes_reel);
@@ -1571,10 +1436,8 @@ void logRecord()
     myFile.print(tx_chauffe);
     myFile.print('\n');
     myFile.close();
-  }
-  else
-  {
-    DEBUGPRINTLN("Error Writing info to Datalogfile = " + datalogFile);
+  } else {
+    DEBUGPRINTLN("Error Writing info to Datalogfile");
   }
 
   digitalWrite(config.ledPin, 0);
@@ -1583,7 +1446,6 @@ void logRecord()
   DEBUGPRINTLN("Theta_mesure : " + String(theta_mesure));
   DEBUGPRINTLN("Taux chauffe (PID) : " + String(tx_chauffe));
   //CLS();                      // On ne refresh l'écran que toutes les 10 secondes, pour éviter l'effet stroboscopique
-
 }
 
 
@@ -1592,12 +1454,15 @@ void logRecord()
 // Loads the configuration from a file
 void loadConfiguration(const char *filename, Config &config) {
   // Open file for reading
-  myFile = sd.open(filename);
+  myFile = sd.open(filename , FILE_READ);
 
+  if (myFile) {
+
+  
   // Allocate a temporary JsonDocument
   // Don't forget to change the capacity to match your requirements.
   // Use arduinojson.org/v6/assistant to compute the capacity.
-  StaticJsonDocument<4096> doc;
+  StaticJsonDocument<2048> doc;
 
   // Deserialize the JSON document
   DeserializationError error = deserializeJson(doc, myFile);
@@ -1607,18 +1472,25 @@ void loadConfiguration(const char *filename, Config &config) {
   // Copy values from the JsonDocument to the Config
   config.hysteresis_Pos = doc["hysteresis_Pos"];
   config.hysteresis_Neg = doc["hysteresis_Neg"];
-  copyArray( doc["myPaliers"] , config.myPaliers );
-  copyArray( doc["myTemperatures"], config.myTemperatures );
-  copyArray( doc["myTempo"], config.myTempo );
-  config.P_strong =  doc["P_strong"];
-  config.I_strong =  doc["I_strong"];
-  config.D_strong =  doc["D_strong"];
+  copyArray(doc["myPaliers"], config.myPaliers);
+  copyArray(doc["myTemperatures"], config.myTemperatures);
+  copyArray(doc["myTempo"], config.myTempo);
+  config.P_strong = doc["P_strong"];
+  config.I_strong = doc["I_strong"];
+  config.D_strong = doc["D_strong"];
   config.P_weak = doc["P_weak"];
   config.I_weak = doc["I_weak"];
   config.D_weak = doc["D_weak"];
   config.PID_OFFSET = doc["PID_OFFSET"];
   config.Beep_PIN = doc["Beep_PIN"];
   config.ledPin = doc["ledPin"];
+    myFile.close();
+    Serial.println("done.");
+  } else {
+    // if the file didn't open, print an error:
+    Serial.println("error opening config.txt");
+  }
+
 
   // Close the file (Curiously, File's destructor doesn't close the file)
   myFile.close();
@@ -1631,23 +1503,25 @@ void saveConfiguration(const char *filename, const Config &config) {
   sd.remove(filename);
 
   // Open file for writing
-  myFile = sd.open(filename, O_WRITE | O_CREAT );
+  myFile = sd.open(filename, FILE_WRITE);
   if (!myFile) {
     Serial.println("Failed to create file");
     return;
   }
+  
+  Serial.println(config.ledPin);
 
   // Allocate a temporary JsonDocument
   // Don't forget to change the capacity to match your requirements.
   // Use arduinojson.org/assistant to compute the capacity.
-  StaticJsonDocument<4096> doc;
+  StaticJsonDocument<2048> doc;
   Serial.println("Allocated");
   // Set the values in the document
   doc["hysteresis_Pos"] = config.hysteresis_Pos;
   doc["hysteresis_Neg"] = config.hysteresis_Neg;
-  copyArray( config.myPaliers, doc["myPaliers"] );
-  copyArray( config.myTemperatures, doc["myTemperatures"] );
-  copyArray( config.myTempo, doc["myTempo"] );
+  copyArray(config.myPaliers, doc["myPaliers"]);
+  copyArray(config.myTemperatures, doc["myTemperatures"]);
+  copyArray(config.myTempo, doc["myTempo"]);
   doc["P_strong"] = config.P_strong;
   doc["I_strong"] = config.I_strong;
   doc["D_strong"] = config.D_strong;
@@ -1658,10 +1532,10 @@ void saveConfiguration(const char *filename, const Config &config) {
   doc["Beep_PIN"] = config.Beep_PIN;
   doc["ledPin"] = config.ledPin;
 
-Serial.println("Assigned");
+  Serial.println("Assigned");
 
   // Serialize JSON to file
-  if (serializeJson(doc, myFile) == 0) {
+  if (serializeJsonPretty(doc, myFile) == 0) {
     Serial.println("Failed to write to file");
   }
 
@@ -1690,4 +1564,91 @@ void printFile(const char *filename) {
 
   // Close the file
   myFile.close();
+}
+
+
+// RTC Stuff
+
+time_t time_provider() {
+  return rtc.now().unixtime();
+}
+
+void setTime() {
+
+  int setrtc[6] = { day(), month(), year(), hour(), minute(), second() };
+  char item_ind[6][21] = {
+    "^^                 ",
+    "   ^^              ",
+    "      ^^^^         ",
+    "           ^^      ",
+    "              ^^   ",
+    "                 ^^"
+  };
+  int item = 0;
+  char str[21];
+
+  CLS();
+
+  lcd_key = btnNONE;
+  delay(1500);
+
+  while (lcd_key != btnSELECT) {
+
+    CLS();  // move to position 0 on the first line
+    lcd.print("Reglage date / heure");
+    lcd.setCursor(0, 1);  // move to position 0 on the second line
+    sprintf(str, "%02i-%02i-%04i %02ih%02im%02i", setrtc[0], setrtc[1], setrtc[2], setrtc[3], setrtc[4], setrtc[5]);
+    lcd.print(str);
+    lcd.setCursor(0, 2);  // move to position 0 on the second line
+    lcd.print(item_ind[item]);
+    lcd.setCursor(0, 3);  // move to position 0 on the second line
+    lcd.print("<< >> ok>Select");
+
+    while (lcd_key == btnNONE) {
+      delay(200);
+      lcd_key = read_LCD_buttons();  // read the buttons
+    }
+
+    switch (lcd_key) {
+      case btnNONE:
+        {
+          break;
+        }
+
+      case btnLEFT:
+        {
+          item = item - 1;
+          break;
+        }
+
+      case btnRIGHT:
+        {
+          item = item + 1;
+          break;
+        }
+
+      case btnDOWN:
+        {
+          DEBUGPRINTLN("Down !");
+          setrtc[item] = setrtc[item] - 1;
+          break;
+        }
+
+      case btnUP:
+        {
+          DEBUGPRINTLN("Up !");
+          setrtc[item] = setrtc[item] + 1;
+          break;
+        }
+
+      case btnSELECT:
+        {
+          DEBUGPRINTLN("Change Time !");
+          rtc.adjust(DateTime(setrtc[2], setrtc[1], setrtc[0], setrtc[3], setrtc[4], setrtc[5]));
+          return;
+        }
+    }
+
+    lcd_key = btnNONE;
+  }
 }
